@@ -1,0 +1,6 @@
+validate
+approvalGate
+deploy
+post deploy smoke test
+tag release
+rollback stage
