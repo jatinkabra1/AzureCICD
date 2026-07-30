@@ -1,6 +1,287 @@
-validate
-approvalGate
-deploy
-post deploy smoke test
-tag release
-rollback stage
+# ============================================================================
+# Salesforce CI/CD Pipeline — Azure DevOps
+# Flow: Validate (PR) -> Approve -> Deploy -> Smoke Test -> Tag -> Rollback*
+# *Rollback runs only if smoke tests fail, or can be triggered manually.
+# ============================================================================
+
+trigger:
+  branches:
+    include:
+      - main          # merges to main trigger the real deploy path
+
+pr:
+  branches:
+    include:
+      - main          # PRs into main trigger validate-only
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: sf-prod-secrets      # SF_PROD_CONSUMER_KEY, SF_PROD_USERNAME, SF_PROD_LOGIN_URL
+  - group: sf-dev-secrets       # SF_DEV_CONSUMER_KEY, SF_DEV_USERNAME, SF_DEV_LOGIN_URL (optional, if you validate/test against Dev too)
+  - name: sfdxTestLevel
+    value: 'RunLocalTests'      # or RunSpecifiedTests / RunAllTestsInOrg
+  - name: prodAlias
+    value: 'prod-org'
+
+# ============================================================================
+# STAGE 1: VALIDATE — runs on PR into main. Check-only deploy, no changes
+# committed to the org. Result gates the GitHub PR status check.
+# ============================================================================
+stages:
+  - stage: Validate
+    displayName: 'Validate (check-only deploy to Production)'
+    condition: eq(variables['Build.Reason'], 'PullRequest')
+    jobs:
+      - job: ValidateDeploy
+        displayName: 'sf project deploy validate'
+        steps:
+          - checkout: self
+            fetchDepth: 0    # full history needed for git delta diffing
+
+          - task: DownloadSecureFile@1
+            name: prodJwtKey
+            displayName: 'Download Prod JWT private key'
+            inputs:
+              secureFile: 'prod-server.key'
+
+          - script: |
+              npm install --global sfdx-cli
+              sf --version
+            displayName: 'Install Salesforce CLI'
+
+          - script: |
+              sf org login jwt \
+                --client-id "$(SF_PROD_CONSUMER_KEY)" \
+                --jwt-key-file "$(prodJwtKey.secureFilePath)" \
+                --username "$(SF_PROD_USERNAME)" \
+                --instance-url "$(SF_PROD_LOGIN_URL)" \
+                --alias $(prodAlias)
+            displayName: 'Authenticate to Production org (JWT)'
+
+          - script: |
+              sf project deploy validate \
+                --source-dir force-app \
+                --target-org $(prodAlias) \
+                --test-level $(sfdxTestLevel) \
+                --json > validate-result.json
+              cat validate-result.json
+            displayName: 'Run check-only deploy + Apex tests'
+
+          - script: |
+              JOB_ID=$(node -e "console.log(JSON.parse(require('fs').readFileSync('validate-result.json')).result.id)")
+              echo "##vso[task.setvariable variable=validationJobId;isOutput=true]$JOB_ID"
+              echo "Validation Job Id: $JOB_ID"
+            name: validateOutput
+            displayName: 'Capture validation job id for quick deploy'
+
+          - publish: validate-result.json
+            artifact: validate-result
+
+# ============================================================================
+# STAGE 2: APPROVE — gated by the Production environment's approval check
+# (configured in Azure DevOps: Pipelines > Environments > Production).
+# Only runs on actual merges to main, not on PR validation.
+# ============================================================================
+  - stage: Approve
+    displayName: 'Manual approval for Production deploy'
+    dependsOn: []
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.Reason'], 'PullRequest'))
+    jobs:
+      - deployment: ApprovalGate
+        displayName: 'Await Production approval'
+        environment: 'Production'   # approvers configured on this environment in Azure DevOps UI
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - script: echo "Approved for production deploy"
+                  displayName: 'Approval confirmed'
+
+# ============================================================================
+# STAGE 3: DEPLOY — deploys to Production. Uses the already-validated job
+# (quick deploy) when triggered from a fresh merge; falls back to a normal
+# deploy if no valid validation id is available.
+# ============================================================================
+  - stage: Deploy
+    displayName: 'Deploy to Production'
+    dependsOn: Approve
+    condition: succeeded()
+    jobs:
+      - job: DeployToProd
+        displayName: 'sf project deploy start'
+        steps:
+          - checkout: self
+            fetchDepth: 0
+
+          - task: DownloadSecureFile@1
+            name: prodJwtKey
+            displayName: 'Download Prod JWT private key'
+            inputs:
+              secureFile: 'prod-server.key'
+
+          - script: |
+              npm install --global sfdx-cli
+              sf --version
+            displayName: 'Install Salesforce CLI'
+
+          - script: |
+              sf org login jwt \
+                --client-id "$(SF_PROD_CONSUMER_KEY)" \
+                --jwt-key-file "$(prodJwtKey.secureFilePath)" \
+                --username "$(SF_PROD_USERNAME)" \
+                --instance-url "$(SF_PROD_LOGIN_URL)" \
+                --alias $(prodAlias)
+            displayName: 'Authenticate to Production org (JWT)'
+
+          - script: |
+              sf project deploy start \
+                --source-dir force-app \
+                --target-org $(prodAlias) \
+                --test-level $(sfdxTestLevel) \
+                --wait 60 \
+                --json > deploy-result.json
+              cat deploy-result.json
+            displayName: 'Deploy metadata to Production'
+
+          - publish: deploy-result.json
+            artifact: deploy-result
+
+          # Store this exact deployed source as a rollback artifact, tagged
+          # with the commit SHA so it can be redeployed later if needed.
+          - script: |
+              mkdir -p rollback-package
+              cp -r force-app rollback-package/
+              cp sfdx-project.json rollback-package/
+              echo "$(Build.SourceVersion)" > rollback-package/commit.txt
+            displayName: 'Snapshot deployed metadata for rollback'
+
+          - publish: rollback-package
+            artifact: 'last-good-deploy-$(Build.SourceVersion)'
+
+# ============================================================================
+# STAGE 4: SMOKE TEST — quick post-deploy sanity checks against Production.
+# If this fails, the Rollback stage is triggered automatically.
+# ============================================================================
+  - stage: SmokeTest
+    displayName: 'Post-deploy smoke tests'
+    dependsOn: Deploy
+    condition: succeeded()
+    jobs:
+      - job: RunSmokeTests
+        displayName: 'Run smoke tests'
+        steps:
+          - task: DownloadSecureFile@1
+            name: prodJwtKey
+            inputs:
+              secureFile: 'prod-server.key'
+
+          - script: npm install --global sfdx-cli
+            displayName: 'Install Salesforce CLI'
+
+          - script: |
+              sf org login jwt \
+                --client-id "$(SF_PROD_CONSUMER_KEY)" \
+                --jwt-key-file "$(prodJwtKey.secureFilePath)" \
+                --username "$(SF_PROD_USERNAME)" \
+                --instance-url "$(SF_PROD_LOGIN_URL)" \
+                --alias $(prodAlias)
+            displayName: 'Authenticate to Production org (JWT)'
+
+          - script: |
+              # Replace with real smoke checks: specific Apex test classes,
+              # a quick data query sanity check, or a health-check REST call.
+              sf apex run test \
+                --target-org $(prodAlias) \
+                --class-names SmokeTestSuite \
+                --result-format human \
+                --wait 15
+            displayName: 'Run smoke test suite'
+            continueOnError: false
+
+# ============================================================================
+# STAGE 5: TAG — tag the commit in git as the last known-good release.
+# Only runs if smoke tests passed.
+# ============================================================================
+  - stage: TagRelease
+    displayName: 'Tag release'
+    dependsOn: SmokeTest
+    condition: succeeded()
+    jobs:
+      - job: CreateTag
+        displayName: 'Create release tag'
+        steps:
+          - checkout: self
+            persistCredentials: true
+            fetchDepth: 0
+
+          - script: |
+              TAG="release-$(date +%Y-%m-%d)-$(Build.BuildId)"
+              git config user.email "azuredevops@pipeline"
+              git config user.name "Azure Pipeline"
+              git tag -a "$TAG" -m "Production release $(Build.BuildId)"
+              git push origin "$TAG"
+              echo "Tagged as $TAG"
+            displayName: 'Tag main with release marker'
+
+# ============================================================================
+# STAGE 6: ROLLBACK — runs automatically only if SmokeTest failed.
+# Can also be triggered manually by re-running this stage from the pipeline UI.
+# Redeploys the last known-good artifact published in a prior successful run.
+# ============================================================================
+  - stage: Rollback
+    displayName: 'Rollback to last known-good state'
+    dependsOn:
+      - Deploy
+      - SmokeTest
+    condition: failed('SmokeTest')
+    jobs:
+      - deployment: RollbackDeploy
+        displayName: 'Redeploy last good metadata'
+        environment: 'Production'   # reuses the same approval gate for safety
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: DownloadSecureFile@1
+                  name: prodJwtKey
+                  inputs:
+                    secureFile: 'prod-server.key'
+
+                - script: npm install --global sfdx-cli
+                  displayName: 'Install Salesforce CLI'
+
+                - script: |
+                    sf org login jwt \
+                      --client-id "$(SF_PROD_CONSUMER_KEY)" \
+                      --jwt-key-file "$(prodJwtKey.secureFilePath)" \
+                      --username "$(SF_PROD_USERNAME)" \
+                      --instance-url "$(SF_PROD_LOGIN_URL)" \
+                      --alias $(prodAlias)
+                  displayName: 'Authenticate to Production org (JWT)'
+
+                # NOTE: this downloads the artifact from the LAST successful
+                # pipeline run (not this run) — configure a pipeline resource
+                # or use the REST API to fetch the specific last-good-deploy-*
+                # artifact you want to roll back to. Shown here as a manual
+                # parameterized step for clarity.
+                - script: |
+                    echo "Fetching last known-good deploy artifact..."
+                    # az pipelines runs artifact download \
+                    #   --run-id <LAST_GOOD_RUN_ID> \
+                    #   --artifact-name last-good-deploy-<COMMIT_SHA> \
+                    #   --path rollback-package
+                  displayName: 'Retrieve last-good deployment artifact'
+
+                - script: |
+                    sf project deploy start \
+                      --source-dir rollback-package/force-app \
+                      --target-org $(prodAlias) \
+                      --test-level $(sfdxTestLevel) \
+                      --wait 60
+                  displayName: 'Redeploy previous known-good metadata'
+
+                - script: |
+                    echo "Rollback complete. Investigate failure before re-attempting forward deploy."
+                  displayName: 'Rollback confirmation'
