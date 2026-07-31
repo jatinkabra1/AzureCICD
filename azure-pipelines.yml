@@ -47,7 +47,7 @@ stages:
               secureFile: 'prod-server.key'
 
           - script: |
-              npm install --global sfdx-cli
+              npm install --global @salesforce/cli
               sf --version
             displayName: 'Install Salesforce CLI'
 
@@ -122,7 +122,7 @@ stages:
               secureFile: 'prod-server.key'
 
           - script: |
-              npm install --global sfdx-cli
+              npm install --global @salesforce/cli
               sf --version
             displayName: 'Install Salesforce CLI'
 
@@ -177,7 +177,7 @@ stages:
             inputs:
               secureFile: 'prod-server.key'
 
-          - script: npm install --global sfdx-cli
+          - script: npm install --global @salesforce/cli
             displayName: 'Install Salesforce CLI'
 
           - script: |
@@ -249,7 +249,7 @@ stages:
                   inputs:
                     secureFile: 'prod-server.key'
 
-                - script: npm install --global sfdx-cli
+                - script: npm install --global @salesforce/cli
                   displayName: 'Install Salesforce CLI'
 
                 - script: |
