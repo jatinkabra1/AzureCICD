@@ -1,0 +1,213 @@
+# ============================================================================
+# Salesforce Standalone Rollback Pipeline — Azure DevOps
+# On-demand "break glass" rollback, independent of the main deploy pipeline.
+# Trigger manually from the Azure DevOps UI ("Run pipeline") and supply the
+# release tag to roll back to (e.g. release-2026-07-28-142).
+# ============================================================================
+
+trigger: none   # never runs automatically — manual trigger only
+pr: none
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+parameters:
+  - name: releaseTag
+    displayName: 'Release tag to roll back to (e.g. release-2026-07-28-142)'
+    type: string
+  - name: testLevel
+    displayName: 'Apex test level for rollback deploy'
+    type: string
+    default: 'RunLocalTests'
+    values:
+      - RunLocalTests
+      - RunAllTestsInOrg
+      - NoTestRun
+  - name: confirmRollback
+    displayName: 'Type CONFIRM to proceed with rollback'
+    type: string
+    default: ''
+
+variables:
+  - group: sf-prod-secrets   # SF_PROD_CONSUMER_KEY, SF_PROD_USERNAME, SF_PROD_LOGIN_URL
+  - name: prodAlias
+    value: 'prod-org'
+
+# ============================================================================
+# STAGE 1: PREPARE — validate inputs and confirm the target tag exists before
+# anything touches Production. Fails fast on bad input or missing tag.
+# ============================================================================
+stages:
+  - stage: Prepare
+    displayName: 'Validate rollback target'
+    jobs:
+      - job: CheckInputs
+        displayName: 'Check confirmation and tag existence'
+        steps:
+          - script: |
+              if [ "${{ parameters.confirmRollback }}" != "CONFIRM" ]; then
+                echo "##vso[task.logissue type=error]Rollback not confirmed. Re-run and type CONFIRM in the confirmRollback parameter."
+                exit 1
+              fi
+            displayName: 'Require explicit confirmation'
+
+          - checkout: self
+            fetchDepth: 0
+
+          - script: |
+              if ! git rev-parse "${{ parameters.releaseTag }}" >/dev/null 2>&1; then
+                echo "##vso[task.logissue type=error]Tag '${{ parameters.releaseTag }}' not found in repo."
+                exit 1
+              fi
+              echo "Tag ${{ parameters.releaseTag }} found. Proceeding."
+            displayName: 'Verify release tag exists'
+
+# ============================================================================
+# STAGE 2: VALIDATE ROLLBACK — check-only deploy of the tagged metadata
+# against Production, so you know it will succeed before committing to it.
+# ============================================================================
+  - stage: ValidateRollback
+    displayName: 'Validate rollback deploy (check-only)'
+    dependsOn: Prepare
+    condition: succeeded()
+    jobs:
+      - job: ValidateTaggedDeploy
+        displayName: 'sf project deploy validate (tagged commit)'
+        steps:
+          - checkout: self
+            fetchDepth: 0
+
+          - script: |
+              git checkout ${{ parameters.releaseTag }}
+            displayName: 'Checkout release tag ${{ parameters.releaseTag }}'
+
+          - task: DownloadSecureFile@1
+            name: prodJwtKey
+            displayName: 'Download Prod JWT private key'
+            inputs:
+              secureFile: 'prod-server.key'
+
+          - script: npm install --global @salesforce/cli
+            displayName: 'Install Salesforce CLI'
+
+          - script: |
+              sf org login jwt \
+                --client-id "$(SF_PROD_CONSUMER_KEY)" \
+                --jwt-key-file "$(prodJwtKey.secureFilePath)" \
+                --username "$(SF_PROD_USERNAME)" \
+                --instance-url "$(SF_PROD_LOGIN_URL)" \
+                --alias $(prodAlias)
+            displayName: 'Authenticate to Production org (JWT)'
+
+          - script: |
+              sf project deploy validate \
+                --source-dir force-app \
+                --target-org $(prodAlias) \
+                --test-level ${{ parameters.testLevel }} \
+                --json > rollback-validate-result.json
+              cat rollback-validate-result.json
+            displayName: 'Check-only deploy of tagged metadata'
+
+          - publish: rollback-validate-result.json
+            artifact: rollback-validate-result
+
+# ============================================================================
+# STAGE 3: APPROVE — manual approval gate on the Production environment.
+# Same gate used by the forward pipeline, so approvers see rollback requests
+# in the same place as regular deploys.
+# ============================================================================
+  - stage: ApproveRollback
+    displayName: 'Manual approval for rollback'
+    dependsOn: ValidateRollback
+    condition: succeeded()
+    jobs:
+      - deployment: ApprovalGate
+        displayName: 'Await Production rollback approval'
+        environment: 'Production'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - script: |
+                    echo "Rollback to ${{ parameters.releaseTag }} approved"
+                  displayName: 'Approval confirmed'
+
+# ============================================================================
+# STAGE 4: DEPLOY ROLLBACK — actually redeploy the tagged (previous good)
+# metadata to Production.
+# ============================================================================
+  - stage: DeployRollback
+    displayName: 'Deploy rollback to Production'
+    dependsOn: ApproveRollback
+    condition: succeeded()
+    jobs:
+      - job: DeployTaggedMetadata
+        displayName: 'sf project deploy start (tagged commit)'
+        steps:
+          - checkout: self
+            fetchDepth: 0
+
+          - script: |
+              git checkout ${{ parameters.releaseTag }}
+            displayName: 'Checkout release tag ${{ parameters.releaseTag }}'
+
+          - task: DownloadSecureFile@1
+            name: prodJwtKey
+            displayName: 'Download Prod JWT private key'
+            inputs:
+              secureFile: 'prod-server.key'
+
+          - script: npm install --global @salesforce/cli
+            displayName: 'Install Salesforce CLI'
+
+          - script: |
+              sf org login jwt \
+                --client-id "$(SF_PROD_CONSUMER_KEY)" \
+                --jwt-key-file "$(prodJwtKey.secureFilePath)" \
+                --username "$(SF_PROD_USERNAME)" \
+                --instance-url "$(SF_PROD_LOGIN_URL)" \
+                --alias $(prodAlias)
+            displayName: 'Authenticate to Production org (JWT)'
+
+          - script: |
+              sf project deploy start \
+                --source-dir force-app \
+                --target-org $(prodAlias) \
+                --test-level ${{ parameters.testLevel }} \
+                --wait 60 \
+                --json > rollback-deploy-result.json
+              cat rollback-deploy-result.json
+            displayName: 'Deploy tagged metadata to Production'
+
+          - publish: rollback-deploy-result.json
+            artifact: rollback-deploy-result
+
+# ============================================================================
+# STAGE 5: POST-ROLLBACK TAG — mark this rollback in git history so the
+# audit trail shows a rollback happened and what it reverted to.
+# ============================================================================
+  - stage: TagRollbackEvent
+    displayName: 'Tag rollback event'
+    dependsOn: DeployRollback
+    condition: succeeded()
+    jobs:
+      - job: CreateRollbackTag
+        displayName: 'Create rollback marker tag'
+        steps:
+          - checkout: self
+            persistCredentials: true
+            fetchDepth: 0
+
+          - script: |
+              git config user.email "azuredevops@pipeline"
+              git config user.name "Azure Pipeline"
+              ROLLBACK_TAG="rollback-$(date +%Y-%m-%d)-to-${{ parameters.releaseTag }}-$(Build.BuildId)"
+              git checkout main
+              git tag -a "$ROLLBACK_TAG" -m "Rolled back Production to ${{ parameters.releaseTag }} via Build $(Build.BuildId)"
+              git push origin "$ROLLBACK_TAG"
+              echo "Rollback event tagged as $ROLLBACK_TAG"
+            displayName: 'Tag rollback event on main'
+
+          - script: |
+              echo "##vso[task.logissue type=warning]Production was rolled back to ${{ parameters.releaseTag }}. main branch still has the reverted changes committed — remember to open a follow-up PR to fix forward or revert the offending commits on main so the branch matches Production."
+            displayName: 'Reminder: reconcile main with Production state'
