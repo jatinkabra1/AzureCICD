@@ -13,8 +13,9 @@ pool:
 
 parameters:
   - name: releaseTag
-    displayName: 'Release tag to roll back to (e.g. release-2026-07-28-142)'
+    displayName: 'Release tag to roll back to. Leave as "latest" to auto-target the most recent successful deploy.'
     type: string
+    default: 'latest'
   - name: testLevel
     displayName: 'Apex test level for rollback deploy'
     type: string
@@ -34,12 +35,46 @@ variables:
     value: 'prod-org'
 
 # ============================================================================
-# STAGE 1: PREPARE — validate inputs and confirm the target tag exists before
-# anything touches Production. Fails fast on bad input or missing tag.
+# STAGE 1: RESOLVE TAG — if the parameter is left as "latest", auto-resolve
+# to the most recent release-* tag. Since TagRelease (in the main pipeline)
+# only ever tags main AFTER a successful deploy + smoke test, the newest
+# release-* tag always represents the last known-good production state.
 # ============================================================================
 stages:
+  - stage: ResolveTag
+    displayName: 'Resolve rollback target tag'
+    jobs:
+      - job: ResolveTargetTag
+        displayName: 'Determine tag to roll back to'
+        steps:
+          - checkout: self
+            fetchDepth: 0
+
+          - script: |
+              if [ "${{ parameters.releaseTag }}" == "latest" ]; then
+                TAG=$(git tag -l "release-*" --sort=-creatordate | head -n 1)
+                if [ -z "$TAG" ]; then
+                  echo "##vso[task.logissue type=error]No release-* tags found in repo. Nothing to roll back to."
+                  exit 1
+                fi
+                echo "Auto-resolved to latest successful release: $TAG"
+              else
+                TAG="${{ parameters.releaseTag }}"
+                echo "Using explicitly provided tag: $TAG"
+              fi
+              echo "##vso[task.setvariable variable=resolvedTag;isOutput=true]$TAG"
+            name: resolve
+            displayName: 'Resolve target release tag'
+
+# ============================================================================
+# STAGE 2: PREPARE — validate inputs and confirm the target tag exists before
+# anything touches Production. Fails fast on bad input or missing tag.
+# ============================================================================
   - stage: Prepare
     displayName: 'Validate rollback target'
+    dependsOn: ResolveTag
+    variables:
+      resolvedTag: $[ stageDependencies.ResolveTag.ResolveTargetTag.outputs['resolve.resolvedTag'] ]
     jobs:
       - job: CheckInputs
         displayName: 'Check confirmation and tag existence'
@@ -55,11 +90,12 @@ stages:
             fetchDepth: 0
 
           - script: |
-              if ! git rev-parse "${{ parameters.releaseTag }}" >/dev/null 2>&1; then
-                echo "##vso[task.logissue type=error]Tag '${{ parameters.releaseTag }}' not found in repo."
+              echo "Resolved rollback target: $(resolvedTag)"
+              if ! git rev-parse "$(resolvedTag)" >/dev/null 2>&1; then
+                echo "##vso[task.logissue type=error]Tag '$(resolvedTag)' not found in repo."
                 exit 1
               fi
-              echo "Tag ${{ parameters.releaseTag }} found. Proceeding."
+              echo "Tag $(resolvedTag) found. Proceeding."
             displayName: 'Verify release tag exists'
 
 # ============================================================================
@@ -68,8 +104,12 @@ stages:
 # ============================================================================
   - stage: ValidateRollback
     displayName: 'Validate rollback deploy (check-only)'
-    dependsOn: Prepare
+    dependsOn:
+      - ResolveTag
+      - Prepare
     condition: succeeded()
+    variables:
+      resolvedTag: $[ stageDependencies.ResolveTag.ResolveTargetTag.outputs['resolve.resolvedTag'] ]
     jobs:
       - job: ValidateTaggedDeploy
         displayName: 'sf project deploy validate (tagged commit)'
@@ -78,8 +118,9 @@ stages:
             fetchDepth: 0
 
           - script: |
-              git checkout ${{ parameters.releaseTag }}
-            displayName: 'Checkout release tag ${{ parameters.releaseTag }}'
+              echo "Checking out $(resolvedTag)"
+              git checkout $(resolvedTag)
+            displayName: 'Checkout resolved release tag'
 
           - task: DownloadSecureFile@1
             name: prodJwtKey
@@ -118,8 +159,12 @@ stages:
 # ============================================================================
   - stage: ApproveRollback
     displayName: 'Manual approval for rollback'
-    dependsOn: ValidateRollback
+    dependsOn:
+      - ResolveTag
+      - ValidateRollback
     condition: succeeded()
+    variables:
+      resolvedTag: $[ stageDependencies.ResolveTag.ResolveTargetTag.outputs['resolve.resolvedTag'] ]
     jobs:
       - deployment: ApprovalGate
         displayName: 'Await Production rollback approval'
@@ -129,17 +174,24 @@ stages:
             deploy:
               steps:
                 - script: |
-                    echo "Rollback to ${{ parameters.releaseTag }} approved"
+                    echo "Rollback to $(resolvedTag) approved"
                   displayName: 'Approval confirmed'
 
 # ============================================================================
-# STAGE 4: DEPLOY ROLLBACK — actually redeploy the tagged (previous good)
-# metadata to Production.
+# STAGE 4: DEPLOY ROLLBACK — redeploys the tagged (previous stable) metadata
+# to Production. This restores modified components to their previous state.
+# It does NOT delete components the bad deploy added (see note below) —
+# for most rollback scenarios (bad code/config change to existing
+# components) this is sufficient and lower-risk than deleting metadata.
 # ============================================================================
   - stage: DeployRollback
     displayName: 'Deploy rollback to Production'
-    dependsOn: ApproveRollback
+    dependsOn:
+      - ResolveTag
+      - ApproveRollback
     condition: succeeded()
+    variables:
+      resolvedTag: $[ stageDependencies.ResolveTag.ResolveTargetTag.outputs['resolve.resolvedTag'] ]
     jobs:
       - job: DeployTaggedMetadata
         displayName: 'sf project deploy start (tagged commit)'
@@ -148,17 +200,18 @@ stages:
             fetchDepth: 0
 
           - script: |
-              git checkout ${{ parameters.releaseTag }}
-            displayName: 'Checkout release tag ${{ parameters.releaseTag }}'
+              echo "Checking out $(resolvedTag) to restore known-good metadata"
+              git checkout $(resolvedTag)
+            displayName: 'Checkout resolved release tag'
+
+          - script: npm install --global @salesforce/cli
+            displayName: 'Install Salesforce CLI'
 
           - task: DownloadSecureFile@1
             name: prodJwtKey
             displayName: 'Download Prod JWT private key'
             inputs:
               secureFile: 'prod-server.key'
-
-          - script: npm install --global @salesforce/cli
-            displayName: 'Install Salesforce CLI'
 
           - script: |
               sf org login jwt \
@@ -188,8 +241,12 @@ stages:
 # ============================================================================
   - stage: TagRollbackEvent
     displayName: 'Tag rollback event'
-    dependsOn: DeployRollback
+    dependsOn:
+      - ResolveTag
+      - DeployRollback
     condition: succeeded()
+    variables:
+      resolvedTag: $[ stageDependencies.ResolveTag.ResolveTargetTag.outputs['resolve.resolvedTag'] ]
     jobs:
       - job: CreateRollbackTag
         displayName: 'Create rollback marker tag'
@@ -201,13 +258,13 @@ stages:
           - script: |
               git config user.email "azuredevops@pipeline"
               git config user.name "Azure Pipeline"
-              ROLLBACK_TAG="rollback-$(date +%Y-%m-%d)-to-${{ parameters.releaseTag }}-$(Build.BuildId)"
+              ROLLBACK_TAG="rollback-$(date +%Y-%m-%d)-to-$(resolvedTag)-$(Build.BuildId)"
               git checkout main
-              git tag -a "$ROLLBACK_TAG" -m "Rolled back Production to ${{ parameters.releaseTag }} via Build $(Build.BuildId)"
+              git tag -a "$ROLLBACK_TAG" -m "Rolled back Production to $(resolvedTag) via Build $(Build.BuildId)"
               git push origin "$ROLLBACK_TAG"
               echo "Rollback event tagged as $ROLLBACK_TAG"
             displayName: 'Tag rollback event on main'
 
           - script: |
-              echo "##vso[task.logissue type=warning]Production was rolled back to ${{ parameters.releaseTag }}. main branch still has the reverted changes committed — remember to open a follow-up PR to fix forward or revert the offending commits on main so the branch matches Production."
+              echo "##vso[task.logissue type=warning]Production was rolled back to $(resolvedTag). main branch still has the reverted changes committed — remember to open a follow-up PR to fix forward or revert the offending commits on main so the branch matches Production."
             displayName: 'Reminder: reconcile main with Production state'
