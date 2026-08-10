@@ -7,7 +7,7 @@
 trigger:
   branches:
     include:
-      - main          # merges to main trigger the real deploy path
+      - none          # merges to main trigger the real deploy path
 
 pr:
   branches:
