@@ -261,6 +261,20 @@ stages:
 
               with open('manual-destructive/destructiveChanges.xml', 'w') as f:
                   f.write('\n'.join(lines))
+
+              # --manifest must point to an EMPTY package (nothing to add/
+              # update) — reusing destructiveChanges.xml here would make the
+              # CLI try to DEPLOY those components instead of deleting them,
+              # which fails silently since there's no local source for them
+              # after checking out the target rollback tag.
+              empty_package = (
+                  '<?xml version="1.0" encoding="UTF-8"?>\n'
+                  '<Package xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+                  '    <version>60.0</version>\n'
+                  '</Package>'
+              )
+              with open('manual-destructive/emptyPackage.xml', 'w') as f:
+                  f.write(empty_package)
               PYEOF
 
               echo "----- destructiveChanges.xml to be deployed -----"
@@ -268,15 +282,24 @@ stages:
             displayName: 'Build destructive changes manifest from componentsToDelete'
 
           - script: |
-              MANIFEST="manual-destructive/destructiveChanges.xml"
-              if [ -f "$MANIFEST" ]; then
+              DESTRUCTIVE="manual-destructive/destructiveChanges.xml"
+              EMPTY_MANIFEST="manual-destructive/emptyPackage.xml"
+              if [ -f "$DESTRUCTIVE" ]; then
                 echo "Deleting specified components before restoring old metadata..."
                 sf project deploy start \
-                  --pre-destructive-changes "$MANIFEST" \
-                  --manifest "$MANIFEST" \
+                  --pre-destructive-changes "$DESTRUCTIVE" \
+                  --manifest "$EMPTY_MANIFEST" \
                   --target-org $(prodAlias) \
                   --wait 60 \
-                  --ignore-warnings || echo "##vso[task.logissue type=warning]Deletion had issues — check for dependency conflicts or data-loss warnings and resolve manually if needed."
+                  --ignore-warnings \
+                  --json > destructive-deploy-result.json
+                DEPLOY_EXIT=$?
+                cat destructive-deploy-result.json
+                if [ $DEPLOY_EXIT -ne 0 ]; then
+                  echo "##vso[task.logissue type=error]Component deletion FAILED. Check the output above for dependency conflicts or data-loss warnings. The rollback deploy will still proceed below, but the deleted component(s) may still be present in Production."
+                else
+                  echo "Component deletion succeeded."
+                fi
               else
                 echo "No components to delete — proceeding straight to metadata restore."
               fi
