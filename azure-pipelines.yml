@@ -14,6 +14,16 @@ pr:
     include:
       - main          # PRs into main trigger validate-only
 
+parameters:
+  - name: skipSmokeTest
+    displayName: 'Skip smoke tests (testing only)'
+    type: boolean
+    default: false
+  - name: forceSmokeTestFailure
+    displayName: 'Force smoke test to fail (testing only — exercises automatic Rollback stage)'
+    type: boolean
+    default: false
+
 pool:
   vmImage: 'ubuntu-latest'
 
@@ -24,10 +34,6 @@ variables:
     value: 'RunLocalTests'      # or RunSpecifiedTests / RunAllTestsInOrg
   - name: prodAlias
     value: 'prod-org'
-  - name: forceSmokeTestFailure
-    value: 'false'              # set to 'true' via "Run pipeline > Variables" to deliberately fail smoke test and test the automatic Rollback stage
-  - name: skipSmokeTest
-    value: 'false'              # set to 'true' via "Run pipeline > Variables" to skip smoke tests entirely
 
 # ============================================================================
 # STAGE 1: VALIDATE — runs on PR into main. Check-only deploy, no changes
@@ -171,7 +177,7 @@ stages:
   - stage: SmokeTest
     displayName: 'Post-deploy smoke tests'
     dependsOn: Deploy
-    condition: and(succeeded(), ne(variables['skipSmokeTest'], 'true'))
+    condition: and(succeeded(), eq('${{ parameters.skipSmokeTest }}', 'False'))
     jobs:
       - job: RunSmokeTests
         displayName: 'Run smoke tests'
@@ -194,7 +200,7 @@ stages:
             displayName: 'Authenticate to Production org (JWT)'
 
           - script: |
-              if [ "$(forceSmokeTestFailure)" == "true" ]; then
+              if [ "${{ parameters.forceSmokeTestFailure }}" == "True" ]; then
                 echo "##vso[task.logissue type=warning]forceSmokeTestFailure=true — deliberately failing smoke test to exercise the automatic Rollback stage."
                 exit 1
               fi
