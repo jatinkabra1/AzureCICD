@@ -1,18 +1,20 @@
 # ============================================================================
 # Salesforce CI/CD Pipeline — Azure DevOps
-# Flow: Validate (PR) -> Approve -> Deploy -> Smoke Test -> Tag -> Rollback*
-# *Rollback runs only if smoke tests fail, or can be triggered manually.
+# Flow: Validate (PR) -> Approve -> Deploy -> Smoke Test -> Tag Release
+# Manually triggered (no auto-run on merge to main). No automatic rollback —
+# if smoke tests fail, no tag is created and NO rollback stage runs here.
+# Use the separate azure-pipelines-rollback.yml pipeline to roll back
+# on-demand if needed.
 # ============================================================================
 
-trigger:
-  branches:
-    include:
-      - none          # merges to main trigger the real deploy path
+trigger: none   # disabled — pipeline no longer runs automatically on merge to main.
+                # Trigger a deploy manually: Pipelines > this pipeline > Run pipeline
+                # (defaults to building from 'main' unless you pick another branch).
 
 pr:
   branches:
     include:
-      - main          # PRs into main trigger validate-only
+      - main          # PRs into main still trigger Validate automatically (check-only, no deploy)
 
 parameters:
   - name: skipSmokeTest
@@ -239,64 +241,3 @@ stages:
               git push origin "$TAG"
               echo "Tagged as $TAG"
             displayName: 'Tag main with release marker'
-
-# ============================================================================
-# STAGE 6: ROLLBACK — runs automatically only if SmokeTest failed.
-# Can also be triggered manually by re-running this stage from the pipeline UI.
-# Redeploys the last known-good artifact published in a prior successful run.
-# ============================================================================
-  - stage: Rollback
-    displayName: 'Rollback to last known-good state'
-    dependsOn:
-      - Deploy
-      - SmokeTest
-    condition: failed('SmokeTest')
-    jobs:
-      - deployment: RollbackDeploy
-        displayName: 'Redeploy last good metadata'
-        environment: 'Production'   # reuses the same approval gate for safety
-        strategy:
-          runOnce:
-            deploy:
-              steps:
-                - checkout: self
-                  fetchDepth: 0
-
-                - script: |
-                    TAG=$(git tag -l "release-*" --sort=-creatordate | head -n 1)
-                    if [ -z "$TAG" ]; then
-                      echo "##vso[task.logissue type=error]No release-* tags found. Nothing to roll back to."
-                      exit 1
-                    fi
-                    echo "Rolling back to last known-good release: $TAG"
-                    git checkout "$TAG"
-                  displayName: 'Checkout last known-good release tag'
-
-                - task: DownloadSecureFile@1
-                  name: prodJwtKey
-                  inputs:
-                    secureFile: 'prod-server.key'
-
-                - script: npm install --global @salesforce/cli
-                  displayName: 'Install Salesforce CLI'
-
-                - script: |
-                    sf org login jwt \
-                      --client-id "$(SF_PROD_CONSUMER_KEY)" \
-                      --jwt-key-file "$(prodJwtKey.secureFilePath)" \
-                      --username "$(SF_PROD_USERNAME)" \
-                      --instance-url "$(SF_PROD_LOGIN_URL)" \
-                      --alias $(prodAlias)
-                  displayName: 'Authenticate to Production org (JWT)'
-
-                - script: |
-                    sf project deploy start \
-                      --source-dir force-app \
-                      --target-org $(prodAlias) \
-                      --test-level $(sfdxTestLevel) \
-                      --wait 60
-                  displayName: 'Redeploy previous known-good metadata'
-
-                - script: |
-                    echo "Rollback complete. Investigate failure before re-attempting forward deploy."
-                  displayName: 'Rollback confirmation'
