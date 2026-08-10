@@ -28,6 +28,10 @@ parameters:
     displayName: 'Type CONFIRM to proceed with rollback'
     type: string
     default: ''
+  - name: componentsToDelete
+    displayName: 'OPTIONAL: components to delete during rollback (Type:Name, comma-separated, e.g. "ValidationRule:Account.Test_Rollback_Block_Saves,ApexClass:BadClass"). Leave blank to skip deletion entirely.'
+    type: string
+    default: ''
 
 variables:
   - group: sf-prod-secrets   # SF_PROD_CONSUMER_KEY, SF_PROD_USERNAME, SF_PROD_LOGIN_URL
@@ -221,6 +225,62 @@ stages:
                 --instance-url "$(SF_PROD_LOGIN_URL)" \
                 --alias $(prodAlias)
             displayName: 'Authenticate to Production org (JWT)'
+
+          # OPTIONAL: only runs if componentsToDelete was filled in. Deletes
+          # the specified components BEFORE restoring old metadata, so any
+          # component the "bad" release added (and which a plain redeploy
+          # would otherwise leave behind) is explicitly removed. Skipped
+          # entirely — no extra risk, no extra step — if left blank.
+          - script: |
+              COMPONENTS="${{ parameters.componentsToDelete }}"
+              if [ -z "$COMPONENTS" ]; then
+                echo "componentsToDelete not provided — skipping deletion step."
+                exit 0
+              fi
+
+              mkdir -p manual-destructive
+              python3 - "$COMPONENTS" << 'PYEOF'
+              import sys
+
+              pairs = [p.strip() for p in sys.argv[1].split(',') if p.strip()]
+              by_type = {}
+              for pair in pairs:
+                  type_name, member = pair.split(':', 1)
+                  by_type.setdefault(type_name.strip(), []).append(member.strip())
+
+              lines = ['<?xml version="1.0" encoding="UTF-8"?>',
+                       '<Package xmlns="http://soap.sforce.com/2006/04/metadata">']
+              for type_name, members in by_type.items():
+                  lines.append('    <types>')
+                  for m in members:
+                      lines.append(f'        <members>{m}</members>')
+                  lines.append(f'        <name>{type_name}</name>')
+                  lines.append('    </types>')
+              lines.append('    <version>60.0</version>')
+              lines.append('</Package>')
+
+              with open('manual-destructive/destructiveChanges.xml', 'w') as f:
+                  f.write('\n'.join(lines))
+              PYEOF
+
+              echo "----- destructiveChanges.xml to be deployed -----"
+              cat manual-destructive/destructiveChanges.xml
+            displayName: 'Build destructive changes manifest from componentsToDelete'
+
+          - script: |
+              MANIFEST="manual-destructive/destructiveChanges.xml"
+              if [ -f "$MANIFEST" ]; then
+                echo "Deleting specified components before restoring old metadata..."
+                sf project deploy start \
+                  --pre-destructive-changes "$MANIFEST" \
+                  --manifest "$MANIFEST" \
+                  --target-org $(prodAlias) \
+                  --wait 60 \
+                  --ignore-warnings || echo "##vso[task.logissue type=warning]Deletion had issues — check for dependency conflicts or data-loss warnings and resolve manually if needed."
+              else
+                echo "No components to delete — proceeding straight to metadata restore."
+              fi
+            displayName: 'Delete specified components (if provided)'
 
           - script: |
               sf project deploy start \
