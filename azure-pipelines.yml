@@ -24,6 +24,10 @@ variables:
     value: 'RunLocalTests'      # or RunSpecifiedTests / RunAllTestsInOrg
   - name: prodAlias
     value: 'prod-org'
+  - name: forceSmokeTestFailure
+    value: 'false'              # set to 'true' via "Run pipeline > Variables" to deliberately fail smoke test and test the automatic Rollback stage
+  - name: skipSmokeTest
+    value: 'false'              # set to 'true' via "Run pipeline > Variables" to skip smoke tests entirely
 
 # ============================================================================
 # STAGE 1: VALIDATE — runs on PR into main. Check-only deploy, no changes
@@ -167,7 +171,7 @@ stages:
   - stage: SmokeTest
     displayName: 'Post-deploy smoke tests'
     dependsOn: Deploy
-    condition: succeeded()
+    condition: and(succeeded(), ne(variables['skipSmokeTest'], 'true'))
     jobs:
       - job: RunSmokeTests
         displayName: 'Run smoke tests'
@@ -190,6 +194,11 @@ stages:
             displayName: 'Authenticate to Production org (JWT)'
 
           - script: |
+              if [ "$(forceSmokeTestFailure)" == "true" ]; then
+                echo "##vso[task.logissue type=warning]forceSmokeTestFailure=true — deliberately failing smoke test to exercise the automatic Rollback stage."
+                exit 1
+              fi
+
               # Replace with real smoke checks: specific Apex test classes,
               # a quick data query sanity check, or a health-check REST call.
               sf apex run test \
@@ -202,12 +211,12 @@ stages:
 
 # ============================================================================
 # STAGE 5: TAG — tag the commit in git as the last known-good release.
-# Only runs if smoke tests passed.
+# Only runs if smoke tests passed (or were deliberately skipped).
 # ============================================================================
   - stage: TagRelease
     displayName: 'Tag release'
     dependsOn: SmokeTest
-    condition: succeeded()
+    condition: in(dependencies.SmokeTest.result, 'Succeeded', 'Skipped')
     jobs:
       - job: CreateTag
         displayName: 'Create release tag'
@@ -244,6 +253,19 @@ stages:
           runOnce:
             deploy:
               steps:
+                - checkout: self
+                  fetchDepth: 0
+
+                - script: |
+                    TAG=$(git tag -l "release-*" --sort=-creatordate | head -n 1)
+                    if [ -z "$TAG" ]; then
+                      echo "##vso[task.logissue type=error]No release-* tags found. Nothing to roll back to."
+                      exit 1
+                    fi
+                    echo "Rolling back to last known-good release: $TAG"
+                    git checkout "$TAG"
+                  displayName: 'Checkout last known-good release tag'
+
                 - task: DownloadSecureFile@1
                   name: prodJwtKey
                   inputs:
@@ -261,22 +283,9 @@ stages:
                       --alias $(prodAlias)
                   displayName: 'Authenticate to Production org (JWT)'
 
-                # NOTE: this downloads the artifact from the LAST successful
-                # pipeline run (not this run) — configure a pipeline resource
-                # or use the REST API to fetch the specific last-good-deploy-*
-                # artifact you want to roll back to. Shown here as a manual
-                # parameterized step for clarity.
-                - script: |
-                    echo "Fetching last known-good deploy artifact..."
-                    # az pipelines runs artifact download \
-                    #   --run-id <LAST_GOOD_RUN_ID> \
-                    #   --artifact-name last-good-deploy-<COMMIT_SHA> \
-                    #   --path rollback-package
-                  displayName: 'Retrieve last-good deployment artifact'
-
                 - script: |
                     sf project deploy start \
-                      --source-dir rollback-package/force-app \
+                      --source-dir force-app \
                       --target-org $(prodAlias) \
                       --test-level $(sfdxTestLevel) \
                       --wait 60
