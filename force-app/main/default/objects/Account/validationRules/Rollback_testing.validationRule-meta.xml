@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ValidationRule xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Rollback_testing</fullName>
+    <active>true</active>
+    <description>intentionally blocks all Account saves to test rollback pipeline</description>
+    <errorConditionFormula>True</errorConditionFormula>
+    <errorMessage>This validation rule intentionally blocks all saves to test the rollback pipeline.</errorMessage>
+</ValidationRule>
