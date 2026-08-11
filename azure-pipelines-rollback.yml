@@ -28,10 +28,6 @@ parameters:
     displayName: 'Type CONFIRM to proceed with rollback'
     type: string
     default: ''
-  - name: componentsToDelete
-    displayName: 'OPTIONAL: components to delete during rollback (Type:Name, comma-separated, e.g. "ValidationRule:Account.Test_Rollback_Block_Saves,ApexClass:BadClass"). Leave blank to skip deletion entirely.'
-    type: string
-    default: ''
 
 variables:
   - group: sf-prod-secrets   # SF_PROD_CONSUMER_KEY, SF_PROD_USERNAME, SF_PROD_LOGIN_URL
@@ -204,12 +200,61 @@ stages:
             fetchDepth: 0
 
           - script: |
+              echo "Current main commit (bad state): $(git rev-parse HEAD)"
+              git rev-parse HEAD > /tmp/bad-commit.txt
+            displayName: 'Record current (bad) commit'
+
+          - script: |
+              npm install --global @salesforce/cli
+              echo y | sf plugins install sfdx-git-delta
+            displayName: 'Install Salesforce CLI and sfdx-git-delta'
+
+          # DELTA COMPUTATION: instead of redeploying the entire force-app
+          # folder (slow, deploys unchanged files too), compute exactly which
+          # components differ between the current bad state and the target
+          # tag. --from is the CURRENT (bad) state, --to is the TARGET (old,
+          # stable) tag. This single command produces BOTH:
+          #  - package.xml: modified files, and anything the bad release
+          #    deleted that needs restoring — deployed further below.
+          #  - destructiveChanges.xml: components present in the bad state
+          #    but absent from the target — i.e. exactly what the bad
+          #    release added and needs deleting. Fully automatic, no manual
+          #    input needed.
+          - script: |
+              BAD_COMMIT=$(cat /tmp/bad-commit.txt)
+              mkdir -p rollback-delta
+              sf sgd:source:delta \
+                --from "$BAD_COMMIT" \
+                --to "$(resolvedTag)" \
+                --output rollback-delta \
+                --generate-delta
+
+              if [ -f rollback-delta/package/package.xml ]; then
+                echo "----- Components to redeploy (delta vs bad state) -----"
+                cat rollback-delta/package/package.xml
+              else
+                echo "No modified/added-back components found."
+              fi
+
+              if [ -f rollback-delta/destructiveChanges/destructiveChanges.xml ]; then
+                echo "----- Components to delete (net-new additions from bad release) -----"
+                cat rollback-delta/destructiveChanges/destructiveChanges.xml
+
+                cat > rollback-delta/emptyPackage.xml << 'EOF'
+              <?xml version="1.0" encoding="UTF-8"?>
+              <Package xmlns="http://soap.sforce.com/2006/04/metadata">
+                  <version>60.0</version>
+              </Package>
+              EOF
+              else
+                echo "No components to delete — bad release only modified existing components."
+              fi
+            displayName: 'Compute delta of changed components (bad state vs target tag)'
+
+          - script: |
               echo "Checking out $(resolvedTag) to restore known-good metadata"
               git checkout $(resolvedTag)
             displayName: 'Checkout resolved release tag'
-
-          - script: npm install --global @salesforce/cli
-            displayName: 'Install Salesforce CLI'
 
           - task: DownloadSecureFile@1
             name: prodJwtKey
@@ -226,66 +271,11 @@ stages:
                 --alias $(prodAlias)
             displayName: 'Authenticate to Production org (JWT)'
 
-          # OPTIONAL: only runs if componentsToDelete was filled in. Deletes
-          # the specified components BEFORE restoring old metadata, so any
-          # component the "bad" release added (and which a plain redeploy
-          # would otherwise leave behind) is explicitly removed. Skipped
-          # entirely — no extra risk, no extra step — if left blank.
           - script: |
-              COMPONENTS="${{ parameters.componentsToDelete }}"
-              if [ -z "$COMPONENTS" ]; then
-                echo "componentsToDelete not provided — skipping deletion step."
-                exit 0
-              fi
-
-              mkdir -p manual-destructive
-              python3 - "$COMPONENTS" << 'PYEOF'
-              import sys
-
-              pairs = [p.strip() for p in sys.argv[1].split(',') if p.strip()]
-              by_type = {}
-              for pair in pairs:
-                  type_name, member = pair.split(':', 1)
-                  by_type.setdefault(type_name.strip(), []).append(member.strip())
-
-              lines = ['<?xml version="1.0" encoding="UTF-8"?>',
-                       '<Package xmlns="http://soap.sforce.com/2006/04/metadata">']
-              for type_name, members in by_type.items():
-                  lines.append('    <types>')
-                  for m in members:
-                      lines.append(f'        <members>{m}</members>')
-                  lines.append(f'        <name>{type_name}</name>')
-                  lines.append('    </types>')
-              lines.append('    <version>60.0</version>')
-              lines.append('</Package>')
-
-              with open('manual-destructive/destructiveChanges.xml', 'w') as f:
-                  f.write('\n'.join(lines))
-
-              # --manifest must point to an EMPTY package (nothing to add/
-              # update) — reusing destructiveChanges.xml here would make the
-              # CLI try to DEPLOY those components instead of deleting them,
-              # which fails silently since there's no local source for them
-              # after checking out the target rollback tag.
-              empty_package = (
-                  '<?xml version="1.0" encoding="UTF-8"?>\n'
-                  '<Package xmlns="http://soap.sforce.com/2006/04/metadata">\n'
-                  '    <version>60.0</version>\n'
-                  '</Package>'
-              )
-              with open('manual-destructive/emptyPackage.xml', 'w') as f:
-                  f.write(empty_package)
-              PYEOF
-
-              echo "----- destructiveChanges.xml to be deployed -----"
-              cat manual-destructive/destructiveChanges.xml
-            displayName: 'Build destructive changes manifest from componentsToDelete'
-
-          - script: |
-              DESTRUCTIVE="manual-destructive/destructiveChanges.xml"
-              EMPTY_MANIFEST="manual-destructive/emptyPackage.xml"
+              DESTRUCTIVE="rollback-delta/destructiveChanges/destructiveChanges.xml"
+              EMPTY_MANIFEST="rollback-delta/emptyPackage.xml"
               if [ -f "$DESTRUCTIVE" ]; then
-                echo "Deleting specified components before restoring old metadata..."
+                echo "Deleting components added by the bad release, before restoring old metadata..."
                 sf project deploy start \
                   --pre-destructive-changes "$DESTRUCTIVE" \
                   --manifest "$EMPTY_MANIFEST" \
@@ -303,20 +293,30 @@ stages:
               else
                 echo "No components to delete — proceeding straight to metadata restore."
               fi
-            displayName: 'Delete specified components (if provided)'
+            displayName: 'Delete components added by the bad release (auto-detected)'
 
+          # PARTIAL DEPLOY: uses the delta package.xml computed earlier, so
+          # only components that actually differ from the bad state get
+          # redeployed — not the entire force-app folder. The CLI resolves
+          # each listed component's content from the local project, which
+          # now reflects the target tag's (old, stable) source after the
+          # checkout above.
           - script: |
-              sf project deploy start \
-                --source-dir force-app \
-                --target-org $(prodAlias) \
-                --test-level ${{ parameters.testLevel }} \
-                --wait 60 \
-                --json > rollback-deploy-result.json
-              cat rollback-deploy-result.json
-            displayName: 'Deploy tagged metadata to Production'
+              if [ -f rollback-delta/package/package.xml ]; then
+                sf project deploy start \
+                  --manifest rollback-delta/package/package.xml \
+                  --target-org $(prodAlias) \
+                  --test-level ${{ parameters.testLevel }} \
+                  --wait 60 \
+                  --json > rollback-deploy-result.json
+                cat rollback-deploy-result.json
+              else
+                echo "Nothing to redeploy — target state matched the bad state except for deleted components (handled above, if any)."
+              fi
+            displayName: 'Deploy only the changed components to Production'
 
-          - publish: rollback-deploy-result.json
-            artifact: rollback-deploy-result
+          - publish: rollback-delta
+            artifact: rollback-delta-manifest
 
 # ============================================================================
 # STAGE 5: POST-ROLLBACK TAG — mark this rollback in git history so the
