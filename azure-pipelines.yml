@@ -1,11 +1,10 @@
 # ============================================================================
 # Salesforce CI/CD Pipeline — Azure DevOps
-# Flow: Validate (PR) -> Approve -> Deploy to Dev -> Smoke Test (on Dev)
-#       -> Deploy to Prod -> Tag Release
+# Flow: Validate (PR) -> Approve -> Deploy -> Smoke Test -> Tag Release
 # Manually triggered (no auto-run on merge to main). No automatic rollback —
-# if Dev smoke tests fail, Prod is never touched and no tag is created.
+# if smoke tests fail, no tag is created and NO rollback stage runs here.
 # Use the separate azure-pipelines-rollback.yml pipeline to roll back
-# on-demand if a Prod deploy still needs reverting for any other reason.
+# on-demand if needed.
 # ============================================================================
 
 trigger: none   # disabled — pipeline no longer runs automatically on merge to main.
@@ -15,7 +14,7 @@ trigger: none   # disabled — pipeline no longer runs automatically on merge to
 pr:
   branches:
     include:
-      - main          # PRs into main still trigger Validate automatically (check-only, no deploy)
+      - none          # PRs into main still trigger Validate automatically (check-only, no deploy)
 
 parameters:
   - name: skipSmokeTest
@@ -23,7 +22,7 @@ parameters:
     type: boolean
     default: false
   - name: forceSmokeTestFailure
-    displayName: 'Force smoke test to fail (testing only — verifies Prod deploy is correctly blocked)'
+    displayName: 'Force smoke test to fail (testing only — exercises automatic Rollback stage)'
     type: boolean
     default: false
 
@@ -32,18 +31,15 @@ pool:
 
 variables:
   - group: sf-prod-secrets      # SF_PROD_CONSUMER_KEY, SF_PROD_USERNAME, SF_PROD_LOGIN_URL
-  - group: sf-dev-secrets       # SF_DEV_CONSUMER_KEY, SF_DEV_USERNAME, SF_DEV_LOGIN_URL
+  - group: sf-dev-secrets       # SF_DEV_CONSUMER_KEY, SF_DEV_USERNAME, SF_DEV_LOGIN_URL (optional, if you validate/test against Dev too)
   - name: sfdxTestLevel
     value: 'RunLocalTests'      # or RunSpecifiedTests / RunAllTestsInOrg
   - name: prodAlias
     value: 'prod-org'
-  - name: devAlias
-    value: 'dev-org'
 
 # ============================================================================
-# STAGE 1: VALIDATE — runs on PR into main. Check-only deploy against
-# Production, no changes committed to any org. Result gates the GitHub PR
-# status check.
+# STAGE 1: VALIDATE — runs on PR into main. Check-only deploy, no changes
+# committed to the org. Result gates the GitHub PR status check.
 # ============================================================================
 stages:
   - stage: Validate
@@ -98,12 +94,10 @@ stages:
 # ============================================================================
 # STAGE 2: APPROVE — gated by the Production environment's approval check
 # (configured in Azure DevOps: Pipelines > Environments > Production).
-# Only runs on actual merges to main, not on PR validation. Approving here
-# authorizes the WHOLE promotion path below (Dev deploy, Dev smoke test,
-# and — if that passes — the real Prod deploy).
+# Only runs on actual merges to main, not on PR validation.
 # ============================================================================
   - stage: Approve
-    displayName: 'Manual approval for deploy'
+    displayName: 'Manual approval for Production deploy'
     dependsOn: []
     condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.Reason'], 'PullRequest'))
     jobs:
@@ -114,116 +108,21 @@ stages:
           runOnce:
             deploy:
               steps:
-                - script: echo "Approved — proceeding to Dev deploy and smoke test, then Prod deploy."
+                - script: echo "Approved for production deploy"
                   displayName: 'Approval confirmed'
 
 # ============================================================================
-# STAGE 3: DEPLOY TO DEV — deploys the same metadata to the Dev org first.
-# This gives smoke tests a real, safe environment to run functional checks
-# against BEFORE anything touches Production.
-# ============================================================================
-  - stage: DeployDev
-    displayName: 'Deploy to Dev'
-    dependsOn: Approve
-    condition: succeeded()
-    jobs:
-      - job: DeployToDev
-        displayName: 'sf project deploy start (Dev)'
-        steps:
-          - checkout: self
-            fetchDepth: 0
-
-          - task: DownloadSecureFile@1
-            name: devJwtKey
-            displayName: 'Download Dev JWT private key'
-            inputs:
-              secureFile: 'dev-server.key'
-
-          - script: |
-              npm install --global @salesforce/cli
-              sf --version
-            displayName: 'Install Salesforce CLI'
-
-          - script: |
-              sf org login jwt \
-                --client-id "$(SF_DEV_CONSUMER_KEY)" \
-                --jwt-key-file "$(devJwtKey.secureFilePath)" \
-                --username "$(SF_DEV_USERNAME)" \
-                --instance-url "$(SF_DEV_LOGIN_URL)" \
-                --alias $(devAlias)
-            displayName: 'Authenticate to Dev org (JWT)'
-
-          - script: |
-              sf project deploy start \
-                --source-dir force-app \
-                --target-org $(devAlias) \
-                --test-level $(sfdxTestLevel) \
-                --wait 60 \
-                --json > dev-deploy-result.json
-              cat dev-deploy-result.json
-            displayName: 'Deploy metadata to Dev'
-
-          - publish: dev-deploy-result.json
-            artifact: dev-deploy-result
-
-# ============================================================================
-# STAGE 4: SMOKE TEST — functional sanity checks run against DEV, before
-# Production is ever touched. If this fails, the pipeline stops here —
-# Prod deploy and tagging never run, so Prod is untouched and safe.
-# ============================================================================
-  - stage: SmokeTest
-    displayName: 'Smoke tests (on Dev, pre-Prod)'
-    dependsOn: DeployDev
-    condition: and(succeeded(), eq('${{ parameters.skipSmokeTest }}', 'False'))
-    jobs:
-      - job: RunSmokeTests
-        displayName: 'Run smoke tests against Dev'
-        steps:
-          - task: DownloadSecureFile@1
-            name: devJwtKey
-            inputs:
-              secureFile: 'dev-server.key'
-
-          - script: npm install --global @salesforce/cli
-            displayName: 'Install Salesforce CLI'
-
-          - script: |
-              sf org login jwt \
-                --client-id "$(SF_DEV_CONSUMER_KEY)" \
-                --jwt-key-file "$(devJwtKey.secureFilePath)" \
-                --username "$(SF_DEV_USERNAME)" \
-                --instance-url "$(SF_DEV_LOGIN_URL)" \
-                --alias $(devAlias)
-            displayName: 'Authenticate to Dev org (JWT)'
-
-          - script: |
-              if [ "${{ parameters.forceSmokeTestFailure }}" == "True" ]; then
-                echo "##vso[task.logissue type=warning]forceSmokeTestFailure=true — deliberately failing smoke test to verify Prod deploy is correctly blocked."
-                exit 1
-              fi
-
-              # Replace with real smoke checks: specific Apex test classes,
-              # a quick data query sanity check, or a health-check REST call.
-              # Runs against Dev — real functional testing, zero Prod risk.
-              sf apex run test \
-                --target-org $(devAlias) \
-                --class-names SmokeTestSuite \
-                --result-format human \
-                --wait 15
-            displayName: 'Run smoke test suite'
-            continueOnError: false
-
-# ============================================================================
-# STAGE 5: DEPLOY TO PROD — only reached if Dev deploy + Dev smoke tests
-# both succeeded. This is the real, live Production deploy.
+# STAGE 3: DEPLOY — deploys to Production. Uses the already-validated job
+# (quick deploy) when triggered from a fresh merge; falls back to a normal
+# deploy if no valid validation id is available.
 # ============================================================================
   - stage: Deploy
     displayName: 'Deploy to Production'
-    dependsOn: SmokeTest
-    condition: in(dependencies.SmokeTest.result, 'Succeeded', 'Skipped')
+    dependsOn: Approve
+    condition: succeeded()
     jobs:
       - job: DeployToProd
-        displayName: 'sf project deploy start (Prod)'
+        displayName: 'sf project deploy start'
         steps:
           - checkout: self
             fetchDepth: 0
@@ -261,14 +160,71 @@ stages:
           - publish: deploy-result.json
             artifact: deploy-result
 
+          # Store this exact deployed source as a rollback artifact, tagged
+          # with the commit SHA so it can be redeployed later if needed.
+          - script: |
+              mkdir -p rollback-package
+              cp -r force-app rollback-package/
+              cp sfdx-project.json rollback-package/
+              echo "$(Build.SourceVersion)" > rollback-package/commit.txt
+            displayName: 'Snapshot deployed metadata for rollback'
+
+          - publish: rollback-package
+            artifact: 'last-good-deploy-$(Build.SourceVersion)'
+
 # ============================================================================
-# STAGE 6: TAG — tag the commit in git as the last known-good release.
-# Only runs after a successful Prod deploy.
+# STAGE 4: SMOKE TEST — quick post-deploy sanity checks against Production.
+# If this fails, the Rollback stage is triggered automatically.
+# ============================================================================
+  - stage: SmokeTest
+    displayName: 'Post-deploy smoke tests'
+    dependsOn: Deploy
+    condition: and(succeeded(), eq('${{ parameters.skipSmokeTest }}', 'False'))
+    jobs:
+      - job: RunSmokeTests
+        displayName: 'Run smoke tests'
+        steps:
+          - task: DownloadSecureFile@1
+            name: prodJwtKey
+            inputs:
+              secureFile: 'prod-server.key'
+
+          - script: npm install --global @salesforce/cli
+            displayName: 'Install Salesforce CLI'
+
+          - script: |
+              sf org login jwt \
+                --client-id "$(SF_PROD_CONSUMER_KEY)" \
+                --jwt-key-file "$(prodJwtKey.secureFilePath)" \
+                --username "$(SF_PROD_USERNAME)" \
+                --instance-url "$(SF_PROD_LOGIN_URL)" \
+                --alias $(prodAlias)
+            displayName: 'Authenticate to Production org (JWT)'
+
+          - script: |
+              if [ "${{ parameters.forceSmokeTestFailure }}" == "True" ]; then
+                echo "##vso[task.logissue type=warning]forceSmokeTestFailure=true — deliberately failing smoke test to exercise the automatic Rollback stage."
+                exit 1
+              fi
+
+              # Replace with real smoke checks: specific Apex test classes,
+              # a quick data query sanity check, or a health-check REST call.
+              sf apex run test \
+                --target-org $(prodAlias) \
+                --class-names SmokeTestSuite \
+                --result-format human \
+                --wait 15
+            displayName: 'Run smoke test suite'
+            continueOnError: false
+
+# ============================================================================
+# STAGE 5: TAG — tag the commit in git as the last known-good release.
+# Only runs if smoke tests passed (or were deliberately skipped).
 # ============================================================================
   - stage: TagRelease
     displayName: 'Tag release'
-    dependsOn: Deploy
-    condition: succeeded()
+    dependsOn: SmokeTest
+    condition: in(dependencies.SmokeTest.result, 'Succeeded', 'Skipped')
     jobs:
       - job: CreateTag
         displayName: 'Create release tag'
@@ -278,66 +234,7 @@ stages:
             fetchDepth: 0
 
           - script: |
-              PREV_TAG=$(git tag -l "release-*" --sort=-creatordate | head -n 1)
-              echo "Previous release tag (before this deploy): ${PREV_TAG:-<none — first release>}"
-              echo "$PREV_TAG" > /tmp/prev-tag.txt
-            displayName: 'Identify previous release tag'
-
-          - script: |
-              npm install --global @salesforce/cli
-              echo y | sf plugins install sfdx-git-delta
-            displayName: 'Install Salesforce CLI and sfdx-git-delta'
-
-          - script: |
-              PREV_TAG=$(cat /tmp/prev-tag.txt)
-              if [ -z "$PREV_TAG" ]; then
-                echo "No previous release tag found — this is the first release, nothing to diff against. Skipping destructive changes generation."
-                exit 0
-              fi
-
-              mkdir -p auto-delta
-              # --from is the CURRENT (new, just-deployed) state, --to is the
-              # PREVIOUS release tag. sgd's destructiveChanges.xml lists
-              # components present in --from but absent in --to — i.e.
-              # exactly the net-new components THIS release added, which is
-              # what would need deleting to fully revert back to the
-              # previous release. This is purely an audit record for this
-              # successful release; it is not consumed by the rollback
-              # pipeline, which computes its own delta fresh at rollback time.
-              sf sgd:source:delta \
-                --from "HEAD" \
-                --to "$PREV_TAG" \
-                --output auto-delta \
-                --generate-delta
-
-              if [ -f auto-delta/destructiveChanges/destructiveChanges.xml ]; then
-                echo "Auto-generated destructive changes (net-new components THIS release added, relative to $PREV_TAG):"
-                cat auto-delta/destructiveChanges/destructiveChanges.xml
-              else
-                echo "This release only modified existing components — no net-new additions, so no destructive changes file needed."
-              fi
-            displayName: 'Generate destructive changes record for this release (vs previous tag)'
-
-          - script: |
               TAG="release-$(date +%Y-%m-%d)-$(Build.BuildId)"
-              echo "$TAG" > /tmp/new-tag.txt
-
-              if [ -f auto-delta/destructiveChanges/destructiveChanges.xml ]; then
-                mkdir -p rollback/releases
-                cp auto-delta/destructiveChanges/destructiveChanges.xml "rollback/releases/destructiveChanges-${TAG}.xml"
-                git config user.email "azuredevops@pipeline"
-                git config user.name "Azure Pipeline"
-                git add "rollback/releases/destructiveChanges-${TAG}.xml"
-                git commit -m "Add destructive changes record for ${TAG}"
-                git push origin HEAD:main
-                echo "Committed rollback/releases/destructiveChanges-${TAG}.xml to main"
-              else
-                echo "No destructive changes file to commit for this release."
-              fi
-            displayName: 'Commit destructive changes record to main (if generated)'
-
-          - script: |
-              TAG=$(cat /tmp/new-tag.txt)
               git config user.email "azuredevops@pipeline"
               git config user.name "Azure Pipeline"
               git tag -a "$TAG" -m "Production release $(Build.BuildId)"
