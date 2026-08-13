@@ -179,10 +179,9 @@ stages:
 
 # ============================================================================
 # STAGE 4: DEPLOY ROLLBACK — redeploys the tagged (previous stable) metadata
-# to Production. This restores modified components to their previous state.
-# It does NOT delete components the bad deploy added (see note below) —
-# for most rollback scenarios (bad code/config change to existing
-# components) this is sufficient and lower-risk than deleting metadata.
+# to Production. Uses a git-delta computation so only components that
+# actually differ get redeployed, and automatically deletes any net-new
+# components the bad release added, that don't exist in the target tag.
 # ============================================================================
   - stage: DeployRollback
     displayName: 'Deploy rollback to Production'
@@ -220,14 +219,27 @@ stages:
           #    but absent from the target — i.e. exactly what the bad
           #    release added and needs deleting. Fully automatic, no manual
           #    input needed.
+          #
+          # NOTE ON COMMAND SYNTAX: the plugin's current published version
+          # uses space-separated command syntax ("sf sgd source delta") with
+          # "--output-dir" — NOT the older colon syntax ("sf sgd:source:delta")
+          # with "--output", which either fails outright or silently produces
+          # no output depending on installed version. Using the wrong form
+          # here was the root cause of components not being deleted on
+          # rollback in earlier testing.
           - script: |
               BAD_COMMIT=$(cat /tmp/bad-commit.txt)
               mkdir -p rollback-delta
-              sf sgd:source:delta \
+              sf sgd source delta \
                 --from "$BAD_COMMIT" \
                 --to "$(resolvedTag)" \
-                --output rollback-delta \
+                --output-dir rollback-delta \
                 --generate-delta
+              SGD_EXIT=$?
+              if [ $SGD_EXIT -ne 0 ]; then
+                echo "##vso[task.logissue type=error]sfdx-git-delta command failed with exit code $SGD_EXIT. No delta was computed — check the log above for the actual CLI error."
+                exit 1
+              fi
 
               if [ -f rollback-delta/package/package.xml ]; then
                 echo "----- Components to redeploy (delta vs bad state) -----"
