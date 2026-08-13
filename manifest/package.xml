@@ -66,9 +66,6 @@
 		<members>*</members>
 		<name>StaticResource</name>
 	</types>
-	<types>
-		<members>Account.Rollback_testing</members>
-		<name>ValidationRule</name>
-	</types>
+	
 	<version>67.0</version>
 </Package>
