@@ -4,7 +4,7 @@
 # Manually triggered (no auto-run on merge to main). No automatic rollback —
 # if smoke tests fail, no tag is created and NO rollback stage runs here.
 # Use the separate azure-pipelines-rollback.yml pipeline to roll back
-# on-demand if needed.
+# on-demand if needed ok.
 # ============================================================================
 
 trigger: none   # disabled — pipeline no longer runs automatically on merge to main.
