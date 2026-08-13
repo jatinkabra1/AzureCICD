@@ -22,7 +22,7 @@ parameters:
     type: boolean
     default: false
   - name: forceSmokeTestFailure
-    displayName: 'Force smoke test to fail (testing only — exercises automatic Rollback stage)'
+    displayName: 'Force smoke test to fail'
     type: boolean
     default: false
 
