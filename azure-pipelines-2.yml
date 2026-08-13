@@ -1,0 +1,449 @@
+# ============================================================================
+# Salesforce Standalone Rollback Pipeline — Azure DevOps
+# On-demand "break glass" rollback, independent of the main deploy pipeline.
+# Trigger manually from the Azure DevOps UI ("Run pipeline") and supply the
+# release tag to roll back to (e.g. release-2026-07-28-142).
+#
+# FIXES APPLIED vs previous version:
+#   1. Every `sf project deploy ...` call now captures its OWN exit code
+#      immediately (not masked by a later `cat`) and fails the step on
+#      non-zero exit. Previously, several steps piped `--json > file.json`
+#      followed by `cat file.json`, which meant the step's exit code was
+#      always cat's (0) regardless of whether the deploy actually succeeded.
+#   2. The destructive-changes (component deletion) step now HARD FAILS the
+#      pipeline if deletion fails, instead of logging a warning and
+#      continuing. This was the most likely cause of "components not
+#      getting deleted" — a failed deletion (e.g. a dependency conflict in
+#      Salesforce) was being treated as a soft warning, so the pipeline
+#      proceeded to the restore deploy and tagged the rollback as complete
+#      even though the stale components were still sitting in Production.
+#   3. sfdx-git-delta plugin version is now pinned, not `sf plugins install
+#      sfdx-git-delta` (latest). You already hit one incident where a
+#      plugin version change silently altered CLI syntax — pin it so that
+#      doesn't happen again. Update PIN_SGD_VERSION below to whatever
+#      version you've validated (run `sf plugins` on a working agent to see
+#      what's currently installed).
+#   4. Destructive-changes deploy now passes --test-level explicitly —
+#      some orgs reject destructive-only deploys to Production without one.
+# ============================================================================
+
+trigger: none   # never runs automatically — manual trigger only
+pr: none
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+parameters:
+  - name: releaseTag
+    displayName: 'Release tag to roll back to. Leave as "latest" to auto-target the most recent successful deploy.'
+    type: string
+    default: 'latest'
+  - name: testLevel
+    displayName: 'Apex test level for rollback deploy'
+    type: string
+    default: 'RunLocalTests'
+    values:
+      - RunLocalTests
+      - RunAllTestsInOrg
+      - NoTestRun
+  - name: confirmRollback
+    displayName: 'Type CONFIRM to proceed with rollback'
+    type: string
+    default: ''
+
+variables:
+  - group: sf-prod-secrets   # SF_PROD_CONSUMER_KEY, SF_PROD_USERNAME, SF_PROD_LOGIN_URL
+  - name: prodAlias
+    value: 'prod-org'
+  - name: sgdVersion          # <-- SET THIS to a version you've validated
+    value: '6.29.0'
+
+# ============================================================================
+# STAGE 1: RESOLVE TAG — if the parameter is left as "latest", auto-resolve
+# to the most recent release-* tag. Since TagRelease (in the main pipeline)
+# only ever tags main AFTER a successful deploy + smoke test, the newest
+# release-* tag always represents the last known-good production state.
+# ============================================================================
+stages:
+  - stage: ResolveTag
+    displayName: 'Resolve rollback target tag'
+    jobs:
+      - job: ResolveTargetTag
+        displayName: 'Determine tag to roll back to'
+        steps:
+          - checkout: self
+            fetchDepth: 0
+
+          - script: |
+              if [ "${{ parameters.releaseTag }}" == "latest" ]; then
+                TAG=$(git tag -l "release-*" --sort=-creatordate | head -n 1)
+                if [ -z "$TAG" ]; then
+                  echo "##vso[task.logissue type=error]No release-* tags found in repo. Nothing to roll back to."
+                  exit 1
+                fi
+                echo "Auto-resolved to latest successful release: $TAG"
+              else
+                TAG="${{ parameters.releaseTag }}"
+                echo "Using explicitly provided tag: $TAG"
+              fi
+              echo "##vso[task.setvariable variable=resolvedTag;isOutput=true]$TAG"
+            name: resolve
+            displayName: 'Resolve target release tag'
+
+# ============================================================================
+# STAGE 2: PREPARE — validate inputs and confirm the target tag exists before
+# anything touches Production. Fails fast on bad input or missing tag.
+# ============================================================================
+  - stage: Prepare
+    displayName: 'Validate rollback target'
+    dependsOn: ResolveTag
+    variables:
+      resolvedTag: $[ stageDependencies.ResolveTag.ResolveTargetTag.outputs['resolve.resolvedTag'] ]
+    jobs:
+      - job: CheckInputs
+        displayName: 'Check confirmation and tag existence'
+        steps:
+          - script: |
+              if [ "${{ parameters.confirmRollback }}" != "CONFIRM" ]; then
+                echo "##vso[task.logissue type=error]Rollback not confirmed. Re-run and type CONFIRM in the confirmRollback parameter."
+                exit 1
+              fi
+            displayName: 'Require explicit confirmation'
+
+          - checkout: self
+            fetchDepth: 0
+
+          - script: |
+              echo "Resolved rollback target: $(resolvedTag)"
+              if ! git rev-parse "$(resolvedTag)" >/dev/null 2>&1; then
+                echo "##vso[task.logissue type=error]Tag '$(resolvedTag)' not found in repo."
+                exit 1
+              fi
+              echo "Tag $(resolvedTag) found. Proceeding."
+            displayName: 'Verify release tag exists'
+
+# ============================================================================
+# STAGE 3: VALIDATE ROLLBACK — check-only deploy of the tagged metadata
+# against Production, so you know it will succeed before committing to it.
+# ============================================================================
+  - stage: ValidateRollback
+    displayName: 'Validate rollback deploy (check-only)'
+    dependsOn:
+      - ResolveTag
+      - Prepare
+    condition: succeeded()
+    variables:
+      resolvedTag: $[ stageDependencies.ResolveTag.ResolveTargetTag.outputs['resolve.resolvedTag'] ]
+    jobs:
+      - job: ValidateTaggedDeploy
+        displayName: 'sf project deploy validate (tagged commit)'
+        steps:
+          - checkout: self
+            fetchDepth: 0
+
+          - script: |
+              echo "Checking out $(resolvedTag)"
+              git checkout $(resolvedTag)
+            displayName: 'Checkout resolved release tag'
+
+          - task: DownloadSecureFile@1
+            name: prodJwtKey
+            displayName: 'Download Prod JWT private key'
+            inputs:
+              secureFile: 'prod-server.key'
+
+          - script: npm install --global @salesforce/cli
+            displayName: 'Install Salesforce CLI'
+
+          - script: |
+              sf org login jwt \
+                --client-id "$(SF_PROD_CONSUMER_KEY)" \
+                --jwt-key-file "$(prodJwtKey.secureFilePath)" \
+                --username "$(SF_PROD_USERNAME)" \
+                --instance-url "$(SF_PROD_LOGIN_URL)" \
+                --alias $(prodAlias)
+            displayName: 'Authenticate to Production org (JWT)'
+
+          - script: |
+              sf project deploy validate \
+                --source-dir force-app \
+                --target-org $(prodAlias) \
+                --test-level ${{ parameters.testLevel }} \
+                --json > rollback-validate-result.json
+              VALIDATE_EXIT=$?
+              cat rollback-validate-result.json
+              if [ $VALIDATE_EXIT -ne 0 ]; then
+                echo "##vso[task.logissue type=error]Check-only validate FAILED (exit $VALIDATE_EXIT). Rollback target would not deploy cleanly — see JSON above for the specific component/test errors. Aborting before touching Production."
+                exit 1
+              fi
+              echo "Validate succeeded — rollback target is deployable."
+            displayName: 'Check-only deploy of tagged metadata'
+
+          - publish: rollback-validate-result.json
+            artifact: rollback-validate-result
+
+# ============================================================================
+# STAGE 4: APPROVE — manual approval gate on the Production environment.
+# Same gate used by the forward pipeline, so approvers see rollback requests
+# in the same place as regular deploys.
+# ============================================================================
+  - stage: ApproveRollback
+    displayName: 'Manual approval for rollback'
+    dependsOn:
+      - ResolveTag
+      - ValidateRollback
+    condition: succeeded()
+    variables:
+      resolvedTag: $[ stageDependencies.ResolveTag.ResolveTargetTag.outputs['resolve.resolvedTag'] ]
+    jobs:
+      - deployment: ApprovalGate
+        displayName: 'Await Production rollback approval'
+        environment: 'Production'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - script: |
+                    echo "Rollback to $(resolvedTag) approved"
+                  displayName: 'Approval confirmed'
+
+# ============================================================================
+# STAGE 5: DEPLOY ROLLBACK — redeploys the tagged (previous stable) metadata
+# to Production. Uses a git-delta computation so only components that
+# actually differ get redeployed, and automatically deletes any net-new
+# components the bad release added, that don't exist in the target tag.
+# ============================================================================
+  - stage: DeployRollback
+    displayName: 'Deploy rollback to Production'
+    dependsOn:
+      - ResolveTag
+      - ApproveRollback
+    condition: succeeded()
+    variables:
+      resolvedTag: $[ stageDependencies.ResolveTag.ResolveTargetTag.outputs['resolve.resolvedTag'] ]
+    jobs:
+      - job: DeployTaggedMetadata
+        displayName: 'sf project deploy start (tagged commit)'
+        steps:
+          - checkout: self
+            fetchDepth: 0
+
+          - script: |
+              echo "Current main commit (bad state): $(git rev-parse HEAD)"
+              git rev-parse HEAD > /tmp/bad-commit.txt
+            displayName: 'Record current (bad) commit'
+
+          - script: |
+              npm install --global @salesforce/cli
+              echo y | sf plugins install sfdx-git-delta@$(sgdVersion)
+            displayName: 'Install Salesforce CLI and sfdx-git-delta (pinned version)'
+
+          # DELTA COMPUTATION: instead of redeploying the entire force-app
+          # folder (slow, deploys unchanged files too), compute exactly which
+          # components differ between the current bad state and the target
+          # tag. --from is the CURRENT (bad) state, --to is the TARGET (old,
+          # stable) tag. This single command produces BOTH:
+          #  - package.xml: modified files, and anything the bad release
+          #    deleted that needs restoring — deployed further below.
+          #  - destructiveChanges.xml: components present in the bad state
+          #    but absent from the target — i.e. exactly what the bad
+          #    release added and needs deleting. Fully automatic, no manual
+          #    input needed.
+          #
+          # NOTE ON COMMAND SYNTAX: the plugin's current published version
+          # uses space-separated command syntax ("sf sgd source delta") with
+          # "--output-dir" — NOT the older colon syntax ("sf sgd:source:delta")
+          # with "--output". The plugin version is now pinned above so this
+          # doesn't drift out from under you again.
+          - script: |
+              BAD_COMMIT=$(cat /tmp/bad-commit.txt)
+              mkdir -p rollback-delta
+              sf sgd source delta \
+                --from "$BAD_COMMIT" \
+                --to "$(resolvedTag)" \
+                --output-dir rollback-delta \
+                --generate-delta
+              SGD_EXIT=$?
+              if [ $SGD_EXIT -ne 0 ]; then
+                echo "##vso[task.logissue type=error]sfdx-git-delta command failed with exit code $SGD_EXIT. No delta was computed — check the log above for the actual CLI error."
+                exit 1
+              fi
+
+              if [ -f rollback-delta/package/package.xml ]; then
+                echo "----- Components to redeploy (delta vs bad state) -----"
+                cat rollback-delta/package/package.xml
+              else
+                echo "No modified/added-back components found."
+              fi
+
+              if [ -f rollback-delta/destructiveChanges/destructiveChanges.xml ]; then
+                echo "----- Components to delete (net-new additions from bad release) -----"
+                cat rollback-delta/destructiveChanges/destructiveChanges.xml
+
+                cat > rollback-delta/emptyPackage.xml << 'EOF'
+              <?xml version="1.0" encoding="UTF-8"?>
+              <Package xmlns="http://soap.sforce.com/2006/04/metadata">
+                  <version>60.0</version>
+              </Package>
+              EOF
+              else
+                echo "No components to delete — bad release only modified existing components."
+              fi
+            displayName: 'Compute delta of changed components (bad state vs target tag)'
+
+          - script: |
+              echo "Checking out $(resolvedTag) to restore known-good metadata"
+              git checkout $(resolvedTag)
+            displayName: 'Checkout resolved release tag'
+
+          - task: DownloadSecureFile@1
+            name: prodJwtKey
+            displayName: 'Download Prod JWT private key'
+            inputs:
+              secureFile: 'prod-server.key'
+
+          - script: |
+              sf org login jwt \
+                --client-id "$(SF_PROD_CONSUMER_KEY)" \
+                --jwt-key-file "$(prodJwtKey.secureFilePath)" \
+                --username "$(SF_PROD_USERNAME)" \
+                --instance-url "$(SF_PROD_LOGIN_URL)" \
+                --alias $(prodAlias)
+            displayName: 'Authenticate to Production org (JWT)'
+
+          # FIX: deletion failure is now FATAL. Previously this only logged
+          # a warning and let the pipeline continue into the restore deploy
+          # and the final "rollback complete" tag — meaning a failed
+          # deletion (e.g. Salesforce refusing to delete a field/class still
+          # referenced elsewhere — validation rule, flow, permission set,
+          # layout, etc.) went unnoticed and the stale component stayed in
+          # Production while the pipeline reported success.
+          - script: |
+              DESTRUCTIVE="rollback-delta/destructiveChanges/destructiveChanges.xml"
+              EMPTY_MANIFEST="rollback-delta/emptyPackage.xml"
+              if [ -f "$DESTRUCTIVE" ]; then
+                echo "Deleting components added by the bad release, before restoring old metadata..."
+                sf project deploy start \
+                  --pre-destructive-changes "$DESTRUCTIVE" \
+                  --manifest "$EMPTY_MANIFEST" \
+                  --target-org $(prodAlias) \
+                  --test-level ${{ parameters.testLevel }} \
+                  --wait 60 \
+                  --ignore-warnings \
+                  --json > destructive-deploy-result.json
+                DEPLOY_EXIT=$?
+                cat destructive-deploy-result.json
+                if [ $DEPLOY_EXIT -ne 0 ]; then
+                  echo "##vso[task.logissue type=error]Component deletion FAILED (exit $DEPLOY_EXIT). This is almost always a Salesforce dependency conflict — check the JSON above for componentFailures (e.g. a field/class still referenced by a validation rule, flow, permission set, or layout that also needs cleanup). Aborting rollback: proceeding to redeploy old metadata on top of an incomplete deletion would leave Production in a mixed, inconsistent state."
+                  exit 1
+                fi
+                echo "Component deletion succeeded."
+              else
+                echo "No components to delete — proceeding straight to metadata restore."
+              fi
+            displayName: 'Delete components added by the bad release (auto-detected)'
+
+          # PARTIAL DEPLOY: uses the delta package.xml computed earlier, so
+          # only components that actually differ from the bad state get
+          # redeployed — not the entire force-app folder. The CLI resolves
+          # each listed component's content from the local project, which
+          # now reflects the target tag's (old, stable) source after the
+          # checkout above.
+          # FIX: exit code is now checked — previously this step had no
+          # failure detection at all, so a failed restore deploy would still
+          # let the pipeline proceed to tag the rollback as complete.
+          - script: |
+              if [ -f rollback-delta/package/package.xml ]; then
+                sf project deploy start \
+                  --manifest rollback-delta/package/package.xml \
+                  --target-org $(prodAlias) \
+                  --test-level ${{ parameters.testLevel }} \
+                  --wait 60 \
+                  --json > rollback-deploy-result.json
+                DEPLOY_EXIT=$?
+                cat rollback-deploy-result.json
+                if [ $DEPLOY_EXIT -ne 0 ]; then
+                  echo "##vso[task.logissue type=error]Restore deploy FAILED (exit $DEPLOY_EXIT). Production is now in a PARTIAL rollback state: bad-release components were deleted above, but the known-good metadata was NOT fully restored. Check the JSON above and remediate manually before re-running."
+                  exit 1
+                fi
+                echo "Restore deploy succeeded."
+              else
+                echo "Nothing to redeploy — target state matched the bad state except for deleted components (handled above, if any)."
+              fi
+            displayName: 'Deploy only the changed components to Production'
+
+          - publish: rollback-delta
+            artifact: rollback-delta-manifest
+
+# ============================================================================
+# STAGE 6: POST-ROLLBACK TAG — mark this rollback in git history so the
+# audit trail shows a rollback happened and what it reverted to.
+# ============================================================================
+  - stage: TagRollbackEvent
+    displayName: 'Tag rollback event'
+    dependsOn:
+      - ResolveTag
+      - DeployRollback
+    condition: succeeded()
+    variables:
+      resolvedTag: $[ stageDependencies.ResolveTag.ResolveTargetTag.outputs['resolve.resolvedTag'] ]
+    jobs:
+      - job: CreateRollbackTag
+        displayName: 'Create rollback marker tag'
+        steps:
+          - checkout: self
+            persistCredentials: true
+            fetchDepth: 0
+
+          - download: current
+            artifact: rollback-delta-manifest
+
+          - script: |
+              ROLLBACK_TAG="rollback-$(date +%Y-%m-%d)-to-$(resolvedTag)-$(Build.BuildId)"
+              echo "$ROLLBACK_TAG" > /tmp/rollback-tag.txt
+
+              HISTORY_DIR="rollback/history/${ROLLBACK_TAG}"
+              mkdir -p "$HISTORY_DIR"
+
+              SRC="$(Pipeline.Workspace)/rollback-delta-manifest"
+              [ -f "$SRC/package/package.xml" ] && cp "$SRC/package/package.xml" "$HISTORY_DIR/package.xml"
+              [ -f "$SRC/destructiveChanges/destructiveChanges.xml" ] && cp "$SRC/destructiveChanges/destructiveChanges.xml" "$HISTORY_DIR/destructiveChanges.xml"
+
+              cat > "$HISTORY_DIR/README.md" << EOF
+              # Rollback record: ${ROLLBACK_TAG}
+
+              - Rolled back to: $(resolvedTag)
+              - Triggered by build: $(Build.BuildId)
+              - Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+              \`package.xml\` — components redeployed to restore the target state.
+              \`destructiveChanges.xml\` — components deleted (added by the bad release, not present in the target state). Absent if nothing needed deleting.
+              EOF
+
+              ls -la "$HISTORY_DIR"
+            displayName: 'Prepare rollback history record'
+
+          - script: |
+              git config user.email "azuredevops@pipeline"
+              git config user.name "Azure Pipeline"
+              ROLLBACK_TAG=$(cat /tmp/rollback-tag.txt)
+              git checkout main
+              git pull origin main
+              git add "rollback/history/${ROLLBACK_TAG}"
+              git commit -m "Rollback audit record: ${ROLLBACK_TAG}" || echo "Nothing to commit (no delta files generated)"
+              git push origin main
+              echo "Committed rollback history for ${ROLLBACK_TAG}"
+            displayName: 'Commit rollback history to main'
+
+          - script: |
+              git config user.email "azuredevops@pipeline"
+              git config user.name "Azure Pipeline"
+              ROLLBACK_TAG=$(cat /tmp/rollback-tag.txt)
+              git tag -a "$ROLLBACK_TAG" -m "Rolled back Production to $(resolvedTag) via Build $(Build.BuildId)"
+              git push origin "$ROLLBACK_TAG"
+              echo "Rollback event tagged as $ROLLBACK_TAG"
+            displayName: 'Tag rollback event on main'
+
+          - script: |
+              echo "##vso[task.logissue type=warning]Production was rolled back to $(resolvedTag). main branch still has the reverted changes committed — remember to open a follow-up PR to fix forward or revert the offending commits on main so the branch matches Production."
+            displayName: 'Reminder: reconcile main with Production state'
