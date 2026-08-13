@@ -2,7 +2,7 @@
 # Salesforce Standalone Rollback Pipeline — Azure DevOps
 # On-demand "break glass" rollback, independent of the main deploy pipeline.
 # Trigger manually from the Azure DevOps UI ("Run pipeline") and supply the
-# release tag to roll back to (e.g. release-2026-07-28-142).
+# release tag to roll backk to (e.g. release-2026-07-28-142).
 # ============================================================================
 
 trigger: none   # never runs automatically — manual trigger only
