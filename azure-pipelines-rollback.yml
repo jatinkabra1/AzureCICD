@@ -338,11 +338,50 @@ stages:
             persistCredentials: true
             fetchDepth: 0
 
+          - download: current
+            artifact: rollback-delta-manifest
+
+          - script: |
+              ROLLBACK_TAG="rollback-$(date +%Y-%m-%d)-to-$(resolvedTag)-$(Build.BuildId)"
+              echo "$ROLLBACK_TAG" > /tmp/rollback-tag.txt
+
+              HISTORY_DIR="rollback/history/${ROLLBACK_TAG}"
+              mkdir -p "$HISTORY_DIR"
+
+              SRC="$(Pipeline.Workspace)/rollback-delta-manifest"
+              [ -f "$SRC/package/package.xml" ] && cp "$SRC/package/package.xml" "$HISTORY_DIR/package.xml"
+              [ -f "$SRC/destructiveChanges/destructiveChanges.xml" ] && cp "$SRC/destructiveChanges/destructiveChanges.xml" "$HISTORY_DIR/destructiveChanges.xml"
+
+              cat > "$HISTORY_DIR/README.md" << EOF
+              # Rollback record: ${ROLLBACK_TAG}
+
+              - Rolled back to: $(resolvedTag)
+              - Triggered by build: $(Build.BuildId)
+              - Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+              \`package.xml\` — components redeployed to restore the target state.
+              \`destructiveChanges.xml\` — components deleted (added by the bad release, not present in the target state). Absent if nothing needed deleting.
+              EOF
+
+              ls -la "$HISTORY_DIR"
+            displayName: 'Prepare rollback history record'
+
           - script: |
               git config user.email "azuredevops@pipeline"
               git config user.name "Azure Pipeline"
-              ROLLBACK_TAG="rollback-$(date +%Y-%m-%d)-to-$(resolvedTag)-$(Build.BuildId)"
+              ROLLBACK_TAG=$(cat /tmp/rollback-tag.txt)
               git checkout main
+              git pull origin main
+              git add "rollback/history/${ROLLBACK_TAG}"
+              git commit -m "Rollback audit record: ${ROLLBACK_TAG}" || echo "Nothing to commit (no delta files generated)"
+              git push origin main
+              echo "Committed rollback history for ${ROLLBACK_TAG}"
+            displayName: 'Commit rollback history to main'
+
+          - script: |
+              git config user.email "azuredevops@pipeline"
+              git config user.name "Azure Pipeline"
+              ROLLBACK_TAG=$(cat /tmp/rollback-tag.txt)
               git tag -a "$ROLLBACK_TAG" -m "Rolled back Production to $(resolvedTag) via Build $(Build.BuildId)"
               git push origin "$ROLLBACK_TAG"
               echo "Rollback event tagged as $ROLLBACK_TAG"

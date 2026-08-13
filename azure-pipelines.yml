@@ -14,7 +14,7 @@ trigger: none   # disabled — pipeline no longer runs automatically on merge to
 pr:
   branches:
     include:
-      - main          # PRs into main still trigger Validate automatically (check-only, no deploy)
+      - none          # PRs into main still trigger Validate automatically (check-only, no deploy)
 
 parameters:
   - name: skipSmokeTest
