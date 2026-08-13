@@ -1,0 +1,771 @@
+# ============================================================================
+# Salesforce CI/CD Pipeline — Azure DevOps
+#
+# FLOW:
+#
+# Feature Branch
+#      ↓
+# Pull Request → main
+#      ↓
+# PR Validation
+#      ↓
+# PR Approved
+#      ↓
+# Merge to main
+#      ↓
+# Production Approval
+#      ↓
+# Production Deploy
+#      ↓
+# Smoke Tests
+#      ↓
+#   ┌───────────────┐
+#   │               │
+# PASS             FAIL
+#   │               │
+#   ▼               ▼
+# TAG          PIPELINE FAILED
+#
+# TESTING OPTIONS:
+#
+# skipSmokeTest = true
+#     → Smoke test is skipped
+#     → Tag stage still runs
+#
+# forceSmokeTestFailure = true
+#     → Smoke test deliberately fails
+#     → Tag stage does NOT run
+#
+# IMPORTANT:
+# - NO automatic rollback is implemented.
+# - If smoke tests fail, the pipeline fails.
+# - Manual investigation/fix is required.
+# ============================================================================
+
+
+# ============================================================================
+# CI TRIGGER
+#
+# Automatically run when changes are pushed/merged to main.
+#
+# Feature branches do not trigger the production stages directly.
+# ============================================================================
+
+trigger:
+  branches:
+    include:
+      - main
+
+
+# ============================================================================
+# PR TRIGGER
+#
+# Run PR validation when a Pull Request targets main.
+# ============================================================================
+
+pr:
+  branches:
+    include:
+      - main
+
+
+# ============================================================================
+# PARAMETERS
+#
+# These are intentionally kept for TESTING purposes.
+#
+# In a final production pipeline, you may remove these parameters.
+# ============================================================================
+
+parameters:
+
+  # --------------------------------------------------------------------------
+  # Skip Smoke Test
+  #
+  # true:
+  #   SmokeTest stage is skipped.
+  #   TagRelease stage is still allowed to run.
+  #
+  # false:
+  #   SmokeTest stage runs normally.
+  # --------------------------------------------------------------------------
+
+  - name: skipSmokeTest
+
+    displayName: 'Skip smoke tests (TESTING ONLY)'
+
+    type: boolean
+
+    default: false
+
+
+  # --------------------------------------------------------------------------
+  # Force Smoke Test Failure
+  #
+  # true:
+  #   Smoke test deliberately fails.
+  #
+  # false:
+  #   Normal smoke test execution.
+  # --------------------------------------------------------------------------
+
+  - name: forceSmokeTestFailure
+
+    displayName: 'Force smoke test to fail (TESTING ONLY)'
+
+    type: boolean
+
+    default: false
+
+
+# ============================================================================
+# AGENT POOL
+# ============================================================================
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+
+# ============================================================================
+# VARIABLES
+# ============================================================================
+
+variables:
+
+  # --------------------------------------------------------------------------
+  # Production Salesforce secrets
+  #
+  # Configure these in:
+  #
+  # Azure DevOps
+  #   → Pipelines
+  #   → Library
+  #   → Variable groups
+  #   → sf-prod-secrets
+  #
+  # Required variables:
+  #
+  # SF_PROD_CONSUMER_KEY
+  # SF_PROD_USERNAME
+  # SF_PROD_LOGIN_URL
+  # --------------------------------------------------------------------------
+
+  - group: sf-prod-secrets
+
+
+  # --------------------------------------------------------------------------
+  # Salesforce Apex test level
+  #
+  # Options:
+  #
+  # RunLocalTests
+  # RunSpecifiedTests
+  # RunAllTestsInOrg
+  # --------------------------------------------------------------------------
+
+  - name: sfdxTestLevel
+
+    value: 'RunLocalTests'
+
+
+  # --------------------------------------------------------------------------
+  # Salesforce org alias
+  # --------------------------------------------------------------------------
+
+  - name: prodAlias
+
+    value: 'prod-org'
+
+
+# ============================================================================
+# STAGES
+# ============================================================================
+
+
+# ============================================================================
+# STAGE 1
+#
+# PR VALIDATION
+#
+# This stage runs only for Pull Request builds.
+#
+# It performs:
+#
+#   Salesforce check-only deployment
+#   Apex tests
+#   Metadata validation
+#
+# NOTHING is deployed to Production.
+# ============================================================================
+
+stages:
+
+  - stage: PRValidation
+
+    displayName: 'PR Validation'
+
+    # Only execute this stage for Pull Request builds.
+    condition: eq(variables['Build.Reason'], 'PullRequest')
+
+
+    jobs:
+
+      - job: ValidateSalesforce
+
+        displayName: 'Validate Salesforce Metadata'
+
+
+        steps:
+
+          # ------------------------------------------------------------------
+          # Checkout repository
+          # ------------------------------------------------------------------
+
+          - checkout: self
+
+            fetchDepth: 0
+
+            displayName: 'Checkout source code'
+
+
+          # ------------------------------------------------------------------
+          # Download Production JWT private key
+          # ------------------------------------------------------------------
+
+          - task: DownloadSecureFile@1
+
+            name: prodJwtKey
+
+            displayName: 'Download Production JWT private key'
+
+            inputs:
+
+              secureFile: 'prod-server.key'
+
+
+          # ------------------------------------------------------------------
+          # Install Salesforce CLI
+          # ------------------------------------------------------------------
+
+          - script: |
+
+              npm install --global @salesforce/cli
+
+              sf --version
+
+            displayName: 'Install Salesforce CLI'
+
+
+          # ------------------------------------------------------------------
+          # Authenticate to Salesforce Production
+          # ------------------------------------------------------------------
+
+          - script: |
+
+              sf org login jwt \
+                --client-id "$(SF_PROD_CONSUMER_KEY)" \
+                --jwt-key-file "$(prodJwtKey.secureFilePath)" \
+                --username "$(SF_PROD_USERNAME)" \
+                --instance-url "$(SF_PROD_LOGIN_URL)" \
+                --alias "$(prodAlias)"
+
+            displayName: 'Authenticate to Salesforce Production'
+
+
+          # ------------------------------------------------------------------
+          # Salesforce CHECK-ONLY deployment
+          #
+          # IMPORTANT:
+          #
+          # sf project deploy validate
+          #
+          # validates the deployment but does NOT deploy the metadata.
+          # ------------------------------------------------------------------
+
+          - script: |
+
+              sf project deploy validate \
+                --source-dir force-app \
+                --target-org "$(prodAlias)" \
+                --test-level "$(sfdxTestLevel)" \
+                --wait 60 \
+                --json > validate-result.json
+
+              cat validate-result.json
+
+            displayName: 'Salesforce Check-Only Validation'
+
+
+          # ------------------------------------------------------------------
+          # Publish validation result as Azure DevOps artifact
+          # ------------------------------------------------------------------
+
+          - publish: validate-result.json
+
+            artifact: pr-validation-result
+
+            displayName: 'Publish PR validation result'
+
+
+
+# ============================================================================
+# STAGE 2
+#
+# PRODUCTION APPROVAL
+#
+# This stage runs after code has been merged into main.
+#
+# Approval is controlled through the Azure DevOps Production Environment.
+#
+# Configure:
+#
+# Azure DevOps
+#   → Pipelines
+#   → Environments
+#   → Production
+#   → Approvals and checks
+# ============================================================================
+
+  - stage: ProductionApproval
+
+    displayName: 'Production Approval'
+
+
+    # ------------------------------------------------------------------------
+    # This stage is intentionally independent of PRValidation.
+    #
+    # Why?
+    #
+    # PRValidation runs in a PR pipeline execution.
+    #
+    # After merge, Azure DevOps creates a NEW pipeline execution for main.
+    #
+    # Therefore the main deployment should not depend on the PR stage
+    # existing in the same pipeline execution.
+    # ------------------------------------------------------------------------
+
+    dependsOn: []
+
+
+    # ------------------------------------------------------------------------
+    # Run only for main branch and not for PR builds.
+    # ------------------------------------------------------------------------
+
+    condition: >
+      and(
+        succeeded(),
+        eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+        ne(variables['Build.Reason'], 'PullRequest')
+      )
+
+
+    jobs:
+
+      - deployment: ProductionApprovalGate
+
+        displayName: 'Await Production Approval'
+
+
+        # --------------------------------------------------------------------
+        # Azure DevOps Environment
+        #
+        # Configure approvers/checks on this environment.
+        # --------------------------------------------------------------------
+
+        environment: 'Production'
+
+
+        strategy:
+
+          runOnce:
+
+            deploy:
+
+              steps:
+
+                - script: |
+
+                    echo "Production deployment approved."
+
+                  displayName: 'Production approval confirmed'
+
+
+
+# ============================================================================
+# STAGE 3
+#
+# PRODUCTION DEPLOYMENT
+#
+# Runs after ProductionApproval.
+#
+# This is the actual Salesforce deployment.
+# ============================================================================
+
+  - stage: ProductionDeploy
+
+    displayName: 'Deploy to Salesforce Production'
+
+
+    # Production deployment waits for approval.
+    dependsOn: ProductionApproval
+
+
+    # Only run when approval stage succeeds.
+    condition: succeeded()
+
+
+    jobs:
+
+      - job: DeploySalesforce
+
+        displayName: 'Deploy Salesforce Metadata'
+
+
+        steps:
+
+          # ------------------------------------------------------------------
+          # Checkout source code
+          # ------------------------------------------------------------------
+
+          - checkout: self
+
+            fetchDepth: 0
+
+            displayName: 'Checkout main branch'
+
+
+          # ------------------------------------------------------------------
+          # Download Production JWT private key
+          # ------------------------------------------------------------------
+
+          - task: DownloadSecureFile@1
+
+            name: prodJwtKey
+
+            displayName: 'Download Production JWT private key'
+
+            inputs:
+
+              secureFile: 'prod-server.key'
+
+
+          # ------------------------------------------------------------------
+          # Install Salesforce CLI
+          # ------------------------------------------------------------------
+
+          - script: |
+
+              npm install --global @salesforce/cli
+
+              sf --version
+
+            displayName: 'Install Salesforce CLI'
+
+
+          # ------------------------------------------------------------------
+          # Authenticate to Salesforce Production
+          # ------------------------------------------------------------------
+
+          - script: |
+
+              sf org login jwt \
+                --client-id "$(SF_PROD_CONSUMER_KEY)" \
+                --jwt-key-file "$(prodJwtKey.secureFilePath)" \
+                --username "$(SF_PROD_USERNAME)" \
+                --instance-url "$(SF_PROD_LOGIN_URL)" \
+                --alias "$(prodAlias)"
+
+            displayName: 'Authenticate to Salesforce Production'
+
+
+          # ------------------------------------------------------------------
+          # Deploy metadata to Production
+          #
+          # Currently deploying the complete force-app directory.
+          # ------------------------------------------------------------------
+
+          - script: |
+
+              sf project deploy start \
+                --source-dir force-app \
+                --target-org "$(prodAlias)" \
+                --test-level "$(sfdxTestLevel)" \
+                --wait 60 \
+                --json > deploy-result.json
+
+              cat deploy-result.json
+
+            displayName: 'Deploy Metadata to Production'
+
+
+          # ------------------------------------------------------------------
+          # Publish deployment result
+          # ------------------------------------------------------------------
+
+          - publish: deploy-result.json
+
+            artifact: production-deployment-result
+
+            displayName: 'Publish Production deployment result'
+
+
+
+# ============================================================================
+# STAGE 4
+#
+# SMOKE TEST
+#
+# Runs only when:
+#
+# skipSmokeTest = false
+#
+# If forceSmokeTestFailure = true:
+#
+#   Smoke test deliberately fails.
+#
+# If smoke test fails:
+#
+#   Pipeline fails.
+#
+# IMPORTANT:
+#
+# There is NO rollback.
+# ============================================================================
+
+  - stage: SmokeTest
+
+    displayName: 'Post-Deployment Smoke Tests'
+
+
+    # ------------------------------------------------------------------------
+    # Smoke tests depend on successful Production deployment.
+    #
+    # If skipSmokeTest = true:
+    #
+    #   This stage becomes SKIPPED.
+    # ------------------------------------------------------------------------
+
+    dependsOn: ProductionDeploy
+
+
+    condition: >
+      and(
+        succeeded(),
+        eq('${{ parameters.skipSmokeTest }}', 'False')
+      )
+
+
+    jobs:
+
+      - job: RunSmokeTests
+
+        displayName: 'Run Salesforce Smoke Tests'
+
+
+        steps:
+
+          # ------------------------------------------------------------------
+          # Download JWT private key
+          # ------------------------------------------------------------------
+
+          - task: DownloadSecureFile@1
+
+            name: prodJwtKey
+
+            displayName: 'Download Production JWT private key'
+
+            inputs:
+
+              secureFile: 'prod-server.key'
+
+
+          # ------------------------------------------------------------------
+          # Install Salesforce CLI
+          # ------------------------------------------------------------------
+
+          - script: |
+
+              npm install --global @salesforce/cli
+
+              sf --version
+
+            displayName: 'Install Salesforce CLI'
+
+
+          # ------------------------------------------------------------------
+          # Authenticate to Salesforce
+          # ------------------------------------------------------------------
+
+          - script: |
+
+              sf org login jwt \
+                --client-id "$(SF_PROD_CONSUMER_KEY)" \
+                --jwt-key-file "$(prodJwtKey.secureFilePath)" \
+                --username "$(SF_PROD_USERNAME)" \
+                --instance-url "$(SF_PROD_LOGIN_URL)" \
+                --alias "$(prodAlias)"
+
+            displayName: 'Authenticate to Salesforce Production'
+
+
+          # ------------------------------------------------------------------
+          # Run smoke tests
+          #
+          # forceSmokeTestFailure is ONLY for testing the failure path.
+          # ------------------------------------------------------------------
+
+          - script: |
+
+              echo "Starting Salesforce smoke tests..."
+
+              if [ "${{ parameters.forceSmokeTestFailure }}" == "True" ]; then
+
+                echo "=================================================="
+                echo "TESTING MODE"
+                echo "forceSmokeTestFailure = true"
+                echo "Deliberately failing smoke test."
+                echo "=================================================="
+
+                exit 1
+
+              fi
+
+
+              echo "Running actual SmokeTestSuite..."
+
+              sf apex run test \
+                --target-org "$(prodAlias)" \
+                --class-names SmokeTestSuite \
+                --result-format human \
+                --wait 15
+
+            displayName: 'Run Smoke Test Suite'
+
+            continueOnError: false
+
+
+
+# ============================================================================
+# STAGE 5
+#
+# TAG RELEASE
+#
+# This stage runs when:
+#
+#   SmokeTest = Succeeded
+#
+# OR
+#
+#   SmokeTest = Skipped
+#
+# SmokeTest is skipped when:
+#
+#   skipSmokeTest = true
+#
+# Therefore:
+#
+# Normal:
+#
+# Deploy → Smoke Test → PASS → TAG
+#
+# Testing:
+#
+# Deploy → Smoke Test SKIPPED → TAG
+#
+# Failure:
+#
+# Deploy → Smoke Test FAIL → NO TAG
+#
+# IMPORTANT:
+#
+# NO ROLLBACK.
+# ============================================================================
+
+  - stage: TagRelease
+
+    displayName: 'Tag Production Release'
+
+
+    # ------------------------------------------------------------------------
+    # Wait for SmokeTest stage.
+    # ------------------------------------------------------------------------
+
+    dependsOn: SmokeTest
+
+
+    # ------------------------------------------------------------------------
+    # Tag only when:
+    #
+    # SmokeTest = Succeeded
+    #
+    # OR
+    #
+    # SmokeTest = Skipped
+    #
+    # If SmokeTest fails, this condition is FALSE.
+    # ------------------------------------------------------------------------
+
+    condition: >
+      in(
+        dependencies.SmokeTest.result,
+        'Succeeded',
+        'Skipped'
+      )
+
+
+    jobs:
+
+      - job: CreateTag
+
+        displayName: 'Create Git Release Tag'
+
+
+        steps:
+
+          # ------------------------------------------------------------------
+          # Checkout repository
+          #
+          # persistCredentials allows git push using the Azure DevOps
+          # pipeline credentials.
+          # ------------------------------------------------------------------
+
+          - checkout: self
+
+            persistCredentials: true
+
+            fetchDepth: 0
+
+            displayName: 'Checkout repository'
+
+
+          # ------------------------------------------------------------------
+          # Create and push Git release tag
+          # ------------------------------------------------------------------
+
+          - script: |
+
+              TAG="release-$(date +%Y-%m-%d)-$(Build.BuildId)"
+
+
+              echo "Creating release tag:"
+              echo "$TAG"
+
+
+              git config user.email "azuredevops@pipeline"
+
+              git config user.name "Azure Pipeline"
+
+
+              git tag -a "$TAG" \
+                -m "Production release $(Build.BuildId)"
+
+
+              git push origin "$TAG"
+
+
+              echo "=================================================="
+              echo "Production release successfully tagged."
+              echo "Tag: $TAG"
+              echo "=================================================="
+
+            displayName: 'Create Production Release Tag'

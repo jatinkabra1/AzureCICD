@@ -3,6 +3,28 @@
 # On-demand "break glass" rollback, independent of the main deploy pipeline.
 # Trigger manually from the Azure DevOps UI ("Run pipeline") and supply the
 # release tag to roll back to (e.g. release-2026-07-28-142).
+#
+# FIXES APPLIED vs previous version:
+#   1. Every `sf project deploy ...` call now captures its OWN exit code
+#      immediately (not masked by a later `cat`) and fails the step on
+#      non-zero exit. Previously, several steps piped `--json > file.json`
+#      followed by `cat file.json`, which meant the step's exit code was
+#      always cat's (0) regardless of whether the deploy actually succeeded.
+#   2. The destructive-changes (component deletion) step now HARD FAILS the
+#      pipeline if deletion fails, instead of logging a warning and
+#      continuing. This was the most likely cause of "components not
+#      getting deleted" — a failed deletion (e.g. a dependency conflict in
+#      Salesforce) was being treated as a soft warning, so the pipeline
+#      proceeded to the restore deploy and tagged the rollback as complete
+#      even though the stale components were still sitting in Production.
+#   3. sfdx-git-delta plugin version is now pinned, not `sf plugins install
+#      sfdx-git-delta` (latest). You already hit one incident where a
+#      plugin version change silently altered CLI syntax — pin it so that
+#      doesn't happen again. Update PIN_SGD_VERSION below to whatever
+#      version you've validated (run `sf plugins` on a working agent to see
+#      what's currently installed).
+#   4. Destructive-changes deploy now passes --test-level explicitly —
+#      some orgs reject destructive-only deploys to Production without one.
 # ============================================================================
 
 trigger: none   # never runs automatically — manual trigger only
@@ -33,6 +55,8 @@ variables:
   - group: sf-prod-secrets   # SF_PROD_CONSUMER_KEY, SF_PROD_USERNAME, SF_PROD_LOGIN_URL
   - name: prodAlias
     value: 'prod-org'
+  - name: sgdVersion          # <-- SET THIS to a version you've validated
+    value: '6.29.0'
 
 # ============================================================================
 # STAGE 1: RESOLVE TAG — if the parameter is left as "latest", auto-resolve
@@ -99,7 +123,7 @@ stages:
             displayName: 'Verify release tag exists'
 
 # ============================================================================
-# STAGE 2: VALIDATE ROLLBACK — check-only deploy of the tagged metadata
+# STAGE 3: VALIDATE ROLLBACK — check-only deploy of the tagged metadata
 # against Production, so you know it will succeed before committing to it.
 # ============================================================================
   - stage: ValidateRollback
@@ -146,14 +170,20 @@ stages:
                 --target-org $(prodAlias) \
                 --test-level ${{ parameters.testLevel }} \
                 --json > rollback-validate-result.json
+              VALIDATE_EXIT=$?
               cat rollback-validate-result.json
+              if [ $VALIDATE_EXIT -ne 0 ]; then
+                echo "##vso[task.logissue type=error]Check-only validate FAILED (exit $VALIDATE_EXIT). Rollback target would not deploy cleanly — see JSON above for the specific component/test errors. Aborting before touching Production."
+                exit 1
+              fi
+              echo "Validate succeeded — rollback target is deployable."
             displayName: 'Check-only deploy of tagged metadata'
 
           - publish: rollback-validate-result.json
             artifact: rollback-validate-result
 
 # ============================================================================
-# STAGE 3: APPROVE — manual approval gate on the Production environment.
+# STAGE 4: APPROVE — manual approval gate on the Production environment.
 # Same gate used by the forward pipeline, so approvers see rollback requests
 # in the same place as regular deploys.
 # ============================================================================
@@ -178,7 +208,7 @@ stages:
                   displayName: 'Approval confirmed'
 
 # ============================================================================
-# STAGE 4: DEPLOY ROLLBACK — redeploys the tagged (previous stable) metadata
+# STAGE 5: DEPLOY ROLLBACK — redeploys the tagged (previous stable) metadata
 # to Production. Uses a git-delta computation so only components that
 # actually differ get redeployed, and automatically deletes any net-new
 # components the bad release added, that don't exist in the target tag.
@@ -205,8 +235,8 @@ stages:
 
           - script: |
               npm install --global @salesforce/cli
-              echo y | sf plugins install sfdx-git-delta
-            displayName: 'Install Salesforce CLI and sfdx-git-delta'
+              echo y | sf plugins install sfdx-git-delta@$(sgdVersion)
+            displayName: 'Install Salesforce CLI and sfdx-git-delta (pinned version)'
 
           # DELTA COMPUTATION: instead of redeploying the entire force-app
           # folder (slow, deploys unchanged files too), compute exactly which
@@ -223,10 +253,8 @@ stages:
           # NOTE ON COMMAND SYNTAX: the plugin's current published version
           # uses space-separated command syntax ("sf sgd source delta") with
           # "--output-dir" — NOT the older colon syntax ("sf sgd:source:delta")
-          # with "--output", which either fails outright or silently produces
-          # no output depending on installed version. Using the wrong form
-          # here was the root cause of components not being deleted on
-          # rollback in earlier testing.
+          # with "--output". The plugin version is now pinned above so this
+          # doesn't drift out from under you again.
           - script: |
               BAD_COMMIT=$(cat /tmp/bad-commit.txt)
               mkdir -p rollback-delta
@@ -283,6 +311,13 @@ stages:
                 --alias $(prodAlias)
             displayName: 'Authenticate to Production org (JWT)'
 
+          # FIX: deletion failure is now FATAL. Previously this only logged
+          # a warning and let the pipeline continue into the restore deploy
+          # and the final "rollback complete" tag — meaning a failed
+          # deletion (e.g. Salesforce refusing to delete a field/class still
+          # referenced elsewhere — validation rule, flow, permission set,
+          # layout, etc.) went unnoticed and the stale component stayed in
+          # Production while the pipeline reported success.
           - script: |
               DESTRUCTIVE="rollback-delta/destructiveChanges/destructiveChanges.xml"
               EMPTY_MANIFEST="rollback-delta/emptyPackage.xml"
@@ -292,16 +327,17 @@ stages:
                   --pre-destructive-changes "$DESTRUCTIVE" \
                   --manifest "$EMPTY_MANIFEST" \
                   --target-org $(prodAlias) \
+                  --test-level ${{ parameters.testLevel }} \
                   --wait 60 \
                   --ignore-warnings \
                   --json > destructive-deploy-result.json
                 DEPLOY_EXIT=$?
                 cat destructive-deploy-result.json
                 if [ $DEPLOY_EXIT -ne 0 ]; then
-                  echo "##vso[task.logissue type=error]Component deletion FAILED. Check the output above for dependency conflicts or data-loss warnings. The rollback deploy will still proceed below, but the deleted component(s) may still be present in Production."
-                else
-                  echo "Component deletion succeeded."
+                  echo "##vso[task.logissue type=error]Component deletion FAILED (exit $DEPLOY_EXIT). This is almost always a Salesforce dependency conflict — check the JSON above for componentFailures (e.g. a field/class still referenced by a validation rule, flow, permission set, or layout that also needs cleanup). Aborting rollback: proceeding to redeploy old metadata on top of an incomplete deletion would leave Production in a mixed, inconsistent state."
+                  exit 1
                 fi
+                echo "Component deletion succeeded."
               else
                 echo "No components to delete — proceeding straight to metadata restore."
               fi
@@ -313,6 +349,9 @@ stages:
           # each listed component's content from the local project, which
           # now reflects the target tag's (old, stable) source after the
           # checkout above.
+          # FIX: exit code is now checked — previously this step had no
+          # failure detection at all, so a failed restore deploy would still
+          # let the pipeline proceed to tag the rollback as complete.
           - script: |
               if [ -f rollback-delta/package/package.xml ]; then
                 sf project deploy start \
@@ -321,7 +360,13 @@ stages:
                   --test-level ${{ parameters.testLevel }} \
                   --wait 60 \
                   --json > rollback-deploy-result.json
+                DEPLOY_EXIT=$?
                 cat rollback-deploy-result.json
+                if [ $DEPLOY_EXIT -ne 0 ]; then
+                  echo "##vso[task.logissue type=error]Restore deploy FAILED (exit $DEPLOY_EXIT). Production is now in a PARTIAL rollback state: bad-release components were deleted above, but the known-good metadata was NOT fully restored. Check the JSON above and remediate manually before re-running."
+                  exit 1
+                fi
+                echo "Restore deploy succeeded."
               else
                 echo "Nothing to redeploy — target state matched the bad state except for deleted components (handled above, if any)."
               fi
@@ -331,7 +376,7 @@ stages:
             artifact: rollback-delta-manifest
 
 # ============================================================================
-# STAGE 5: POST-ROLLBACK TAG — mark this rollback in git history so the
+# STAGE 6: POST-ROLLBACK TAG — mark this rollback in git history so the
 # audit trail shows a rollback happened and what it reverted to.
 # ============================================================================
   - stage: TagRollbackEvent
