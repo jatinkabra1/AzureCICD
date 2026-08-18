@@ -119,7 +119,7 @@ private class RatingHot_Test {
                 normalAccount.Id
             }
         ];
-// New commit
+// New commit 18-08
 
         Test.startTest();
 
