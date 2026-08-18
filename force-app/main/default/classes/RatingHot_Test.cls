@@ -70,96 +70,96 @@ private class RatingHot_Test {
     }
 
 
-//     @IsTest
-//     static void testUpdateAccountDescription() {
+    @IsTest
+    static void testUpdateAccountDescription() {
 
-//         // Create Accounts covering different conditions
-//         Account largeRevenueAccount = new Account(
-//             Name = 'Large Revenue Account',
-//             AnnualRevenue = 2000000
-//         );
+        // Create Accounts covering different conditions
+        Account largeRevenueAccount = new Account(
+            Name = 'Large Revenue Account',
+            AnnualRevenue = 2000000
+        );
 
-//         Account largeOrganization = new Account(
-//             Name = 'Large Organization',
-//             NumberOfEmployees = 1000
-//         );
+        Account largeOrganization = new Account(
+            Name = 'Large Organization',
+            NumberOfEmployees = 1000
+        );
 
-//         Account technologyAccount = new Account(
-//             Name = 'Technology Account',
-//             Industry = 'Technology'
-//         );
+        Account technologyAccount = new Account(
+            Name = 'Technology Account',
+            Industry = 'Technology'
+        );
 
-//         Account normalAccount = new Account(
-//             Name = 'Normal Account',
-//             Industry = 'Retail',
-//             AnnualRevenue = 100000,
-//             NumberOfEmployees = 10
-//         );
+        Account normalAccount = new Account(
+            Name = 'Normal Account',
+            Industry = 'Retail',
+            AnnualRevenue = 100000,
+            NumberOfEmployees = 10
+        );
 
-//         insert new List<Account>{
-//             largeRevenueAccount,
-//             largeOrganization,
-//             technologyAccount,
-//             normalAccount
-//         };
+        insert new List<Account>{
+            largeRevenueAccount,
+            largeOrganization,
+            technologyAccount,
+            normalAccount
+        };
 
-//         // Query records
-//         List<Account> accounts = [
-//             SELECT Id,
-//                    Name,
-//                    Industry,
-//                    AnnualRevenue,
-//                    NumberOfEmployees,
-//                    Description
-//             FROM Account
-//             WHERE Id IN :new Set<Id>{
-//                 largeRevenueAccount.Id,
-//                 largeOrganization.Id,
-//                 technologyAccount.Id,
-//                 normalAccount.Id
-//             }
-//         ];
+        // Query records
+        List<Account> accounts = [
+            SELECT Id,
+                   Name,
+                   Industry,
+                   AnnualRevenue,
+                   NumberOfEmployees,
+                   Description
+            FROM Account
+            WHERE Id IN :new Set<Id>{
+                largeRevenueAccount.Id,
+                largeOrganization.Id,
+                technologyAccount.Id,
+                normalAccount.Id
+            }
+        ];
 
-//         Test.startTest();
+        Test.startTest();
 
-//        // RatingHot.UpdateAccountDescription(accounts);
+       // RatingHot.UpdateAccountDescription(accounts);
 
-//         Test.stopTest();
+        Test.stopTest();
 
-//         // Query updated records
-//         Map<Id, Account> accountMap = new Map<Id, Account>([
-//             SELECT Id, Name, Description
-//             FROM Account
-//             WHERE Id IN :new Set<Id>{
-//                 largeRevenueAccount.Id,
-//                 largeOrganization.Id,
-//                 technologyAccount.Id,
-//                 normalAccount.Id
-//             }
-//         ]);
+        // Query updated records
+        Map<Id, Account> accountMap = new Map<Id, Account>([
+            SELECT Id, Name, Description
+            FROM Account
+            WHERE Id IN :new Set<Id>{
+                largeRevenueAccount.Id,
+                largeOrganization.Id,
+                technologyAccount.Id,
+                normalAccount.Id
+            }
+        ]);
 
-//         // Verify Annual Revenue condition
-//         System.assertEquals(
-//             'Large Revenue Account',
-//             accountMap.get(largeRevenueAccount.Id).Description
-//         );
+        // Verify Annual Revenue condition
+        System.assertEquals(
+            'Large Revenue Account',
+            accountMap.get(largeRevenueAccount.Id).Description
+        );
 
-//         // Verify Number of Employees condition
-//         System.assertEquals(
-//             'Large Organization',
-//             accountMap.get(largeOrganization.Id).Description
-//         );
+        // Verify Number of Employees condition
+        System.assertEquals(
+            'Large Organization',
+            accountMap.get(largeOrganization.Id).Description
+        );
 
-//         // Verify Industry condition
-//         System.assertEquals(
-//             'Technology Account',
-//             accountMap.get(technologyAccount.Id).Description
-//         );
+        // Verify Industry condition
+        System.assertEquals(
+            'Technology Account',
+            accountMap.get(technologyAccount.Id).Description
+        );
 
-//         // Verify account that doesn't meet any condition
-//         System.assertEquals(
-//             null,
-//             accountMap.get(normalAccount.Id).Description
-//         );
-//     }
+        // Verify account that doesn't meet any condition
+        System.assertEquals(
+            null,
+            accountMap.get(normalAccount.Id).Description
+        );
+    }
 }
