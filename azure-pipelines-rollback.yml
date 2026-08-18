@@ -2,7 +2,7 @@
 # Salesforce Standalone Rollback Pipeline — Azure DevOps
 # On-demand "break glass" rollback, independent of the main deploy pipeline.
 # Trigger manually from the Azure DevOps UI ("Run pipeline") and supply the
-# release tag to roll backk to (e.g. release-2026-07-28-142).
+# release tag to roll back to (e.g. release-2026-07-28-142).
 # ============================================================================
 
 trigger: none   # never runs automatically — manual trigger only
@@ -13,9 +13,9 @@ pool:
 
 parameters:
   - name: releaseTag
-    displayName: 'Release tag to roll back to. Leave as "latest" to auto-target the most recent successful deploy.'
+    displayName: 'Release tag to roll back to. "previous" = second-newest tag (safe default — skips the newest, likely-bad release). "latest" = newest tag. Or type an exact tag name.'
     type: string
-    default: 'latest'
+    default: 'previous'
   - name: testLevel
     displayName: 'Apex test level for rollback deploy'
     type: string
@@ -35,10 +35,14 @@ variables:
     value: 'prod-org'
 
 # ============================================================================
-# STAGE 1: RESOLVE TAG — if the parameter is left as "latest", auto-resolve
-# to the most recent release-* tag. Since TagRelease (in the main pipeline)
-# only ever tags main AFTER a successful deploy + smoke test, the newest
-# release-* tag always represents the last known-good production state.
+# STAGE 1: RESOLVE TAG.
+# "previous" (default) = second-newest release-* tag. The newest tag is
+# skipped, since it's normally the release you're rolling back AWAY from
+# (i.e. the one that's currently live and presumably the problem) — this is
+# the safer default for a typical "something's wrong, go back one step" use.
+# "latest" = newest release-* tag, for cases where you deliberately want to
+# redeploy the current tagged state (rare — mostly for testing/recovery).
+# Any other value is treated as an exact tag name.
 # ============================================================================
 stages:
   - stage: ResolveTag
@@ -51,13 +55,25 @@ stages:
             fetchDepth: 0
 
           - script: |
-              if [ "${{ parameters.releaseTag }}" == "latest" ]; then
+              if [ "${{ parameters.releaseTag }}" == "previous" ]; then
+                # Skip the newest tag — it's usually the release you're
+                # currently rolling back AWAY from (i.e. the likely-bad one)
+                # — and take the one before it instead.
+                TAG=$(git tag -l "release-*" --sort=-creatordate | sed -n '2p')
+                if [ -z "$TAG" ]; then
+                  echo "##vso[task.logissue type=error]Fewer than 2 release-* tags found — cannot resolve 'previous'. Use 'latest' or specify an exact tag."
+                  exit 1
+                fi
+                NEWEST=$(git tag -l "release-*" --sort=-creatordate | head -n 1)
+                echo "Newest tag (assumed bad, skipped): $NEWEST"
+                echo "Auto-resolved to previous release: $TAG"
+              elif [ "${{ parameters.releaseTag }}" == "latest" ]; then
                 TAG=$(git tag -l "release-*" --sort=-creatordate | head -n 1)
                 if [ -z "$TAG" ]; then
                   echo "##vso[task.logissue type=error]No release-* tags found in repo. Nothing to roll back to."
                   exit 1
                 fi
-                echo "Auto-resolved to latest successful release: $TAG"
+                echo "Auto-resolved to latest release: $TAG"
               else
                 TAG="${{ parameters.releaseTag }}"
                 echo "Using explicitly provided tag: $TAG"
