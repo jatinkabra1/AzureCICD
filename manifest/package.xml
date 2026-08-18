@@ -37,7 +37,6 @@
 		<members>Case.PotentialLiability__c</members>
 		<members>Case.Product__c</members>
 		<members>Case.SLAViolation__c</members>
-		<members>Contact.Demo_Field__c</members>
 		<members>Contact.Languages__c</members>
 		<members>Contact.Level__c</members>
 		<members>Goal.OrigGoalId__c</members>
