@@ -119,10 +119,11 @@ private class RatingHot_Test {
                 normalAccount.Id
             }
         ];
+// New commit
 
         Test.startTest();
 
-       // RatingHot.UpdateAccountDescription(accounts);
+        RatingHot.UpdateAccountDescription(accounts);
 
         Test.stopTest();
 

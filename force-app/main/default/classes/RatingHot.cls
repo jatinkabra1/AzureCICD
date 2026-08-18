@@ -2,7 +2,7 @@ public with sharing class RatingHot {
     public RatingHot() {
 
     }
-
+// New Commit
     public static void HotRatingAccounts(List<Account> accounts){
         List<Account> accountsToUpdate = new List<Account>();
 
