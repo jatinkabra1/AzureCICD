@@ -4,7 +4,7 @@
 # Manually triggered (no auto-run on merge to main). No automatic rollback —
 # if smoke tests fail, no tag is created and NO rollback stage runs here.
 # Use the separate azure-pipelines-rollback.yml pipeline to roll back
-# on-demand if needed ok.
+# on-demand if needed.
 # ============================================================================
 
 trigger: none   # disabled — pipeline no longer runs automatically on merge to main.
@@ -147,15 +147,121 @@ stages:
                 --alias $(prodAlias)
             displayName: 'Authenticate to Production org (JWT)'
 
+          # DESTRUCTIVE CHANGES FOR DELETED FILES: a normal source deploy is
+          # additive-only — deleting a field/class/etc. from git does NOT
+          # remove it from the org unless explicitly told to. This step
+          # diffs the last deployed release against the current commit to
+          # find anything that was deleted in git, and builds a
+          # destructiveChanges.xml for it. --from is the PREVIOUS release
+          # (what's currently live in Prod), --to is HEAD (this new deploy)
+          # — so destructiveChanges.xml lists components present in Prod's
+          # current state but absent from this new commit, i.e. exactly
+          # what was deleted and needs removing from the org.
           - script: |
-              sf project deploy start \
-                --source-dir force-app \
-                --target-org $(prodAlias) \
-                --test-level $(sfdxTestLevel) \
-                --wait 60 \
-                --json > deploy-result.json
+              npm install --global @salesforce/cli
+              echo y | sf plugins install sfdx-git-delta
+            displayName: 'Install sfdx-git-delta'
+
+          - script: |
+              PREV_TAG=$(git tag -l "release-*" --sort=-creatordate | head -n 1)
+              echo "$PREV_TAG" > /tmp/prev-tag-for-deploy.txt
+              if [ -z "$PREV_TAG" ]; then
+                echo "No previous release tag found — first deploy. Nothing could have been deleted yet, so a full source-dir deploy below is safe."
+                exit 0
+              fi
+              echo "Diffing against previous release: $PREV_TAG"
+
+              mkdir -p forward-delta
+              sf sgd source delta \
+                --from "$PREV_TAG" \
+                --to "HEAD" \
+                --output-dir forward-delta \
+                --generate-delta
+              SGD_EXIT=$?
+              if [ $SGD_EXIT -ne 0 ]; then
+                # DELIBERATELY NOT a silent fallback here: on any deploy
+                # after the first, we cannot know whether something was
+                # deleted in git since $PREV_TAG without this delta. Silently
+                # falling back to a full source-dir deploy would deploy
+                # additively only, leaving any deleted component still
+                # sitting in Prod with no indication anything was missed.
+                # Failing loudly forces investigation instead.
+                echo "##vso[task.logissue type=error]sfdx-git-delta failed with exit code $SGD_EXIT. Cannot safely determine whether any components were deleted since $PREV_TAG. Deploy stopped rather than risk silently leaving deleted components in Production. Investigate the sfdx-git-delta error above, or re-run once resolved."
+                exit 1
+              fi
+
+              if [ -f forward-delta/package/package.xml ]; then
+                echo "----- Components to deploy (added/modified since $PREV_TAG) -----"
+                cat forward-delta/package/package.xml
+              else
+                echo "No added/modified components since $PREV_TAG."
+              fi
+
+              if [ -f forward-delta/destructiveChanges/destructiveChanges.xml ]; then
+                echo "----- Components deleted in git since $PREV_TAG (will be removed from Prod) -----"
+                cat forward-delta/destructiveChanges/destructiveChanges.xml
+              else
+                echo "No components were deleted since $PREV_TAG."
+              fi
+
+              # If there's nothing to add/modify (pure-deletion release), the
+              # CLI still needs a --manifest to pair with
+              # --post-destructive-changes — provide an empty one.
+              if [ ! -f forward-delta/package/package.xml ] && [ -f forward-delta/destructiveChanges/destructiveChanges.xml ]; then
+                mkdir -p forward-delta/package
+                cat > forward-delta/package/package.xml << 'EOF'
+              <?xml version="1.0" encoding="UTF-8"?>
+              <Package xmlns="http://soap.sforce.com/2006/04/metadata">
+                  <version>60.0</version>
+              </Package>
+              EOF
+              fi
+            displayName: 'Compute delta of added/modified/deleted components since last release'
+
+
+          - script: |
+              MANIFEST="forward-delta/package/package.xml"
+              DESTRUCTIVE="forward-delta/destructiveChanges/destructiveChanges.xml"
+
+              if [ -f "$MANIFEST" ]; then
+                # DELTA DEPLOY: only components that actually changed since
+                # the last release get deployed — not the entire force-app
+                # directory. Deletions (if any) are applied in the same
+                # transaction via --post-destructive-changes.
+                if [ -f "$DESTRUCTIVE" ]; then
+                  sf project deploy start \
+                    --manifest "$MANIFEST" \
+                    --post-destructive-changes "$DESTRUCTIVE" \
+                    --target-org $(prodAlias) \
+                    --test-level $(sfdxTestLevel) \
+                    --wait 60 \
+                    --ignore-warnings \
+                    --json > deploy-result.json
+                else
+                  sf project deploy start \
+                    --manifest "$MANIFEST" \
+                    --target-org $(prodAlias) \
+                    --test-level $(sfdxTestLevel) \
+                    --wait 60 \
+                    --json > deploy-result.json
+                fi
+              else
+                # FALLBACK: only reached on a genuine first-ever deploy (no
+                # previous tag existed, so nothing to diff against — safe,
+                # nothing could have been deleted). If sgd had failed on a
+                # later deploy, the previous step already stopped the
+                # pipeline before reaching here — this fallback deliberately
+                # does NOT trigger in that case.
+                echo "No delta manifest available — deploying full force-app directory."
+                sf project deploy start \
+                  --source-dir force-app \
+                  --target-org $(prodAlias) \
+                  --test-level $(sfdxTestLevel) \
+                  --wait 60 \
+                  --json > deploy-result.json
+              fi
               cat deploy-result.json
-            displayName: 'Deploy metadata to Production'
+            displayName: 'Deploy only changed components to Production (full deploy on first release)'
 
           - publish: deploy-result.json
             artifact: deploy-result
@@ -234,7 +340,77 @@ stages:
             fetchDepth: 0
 
           - script: |
+              PREV_TAG=$(git tag -l "release-*" --sort=-creatordate | head -n 1)
+              echo "Previous release tag (before this deploy): ${PREV_TAG:-<none — first release>}"
+              echo "$PREV_TAG" > /tmp/prev-tag.txt
+            displayName: 'Identify previous release tag'
+
+          - script: |
+              npm install --global @salesforce/cli
+              echo y | sf plugins install sfdx-git-delta
+            displayName: 'Install Salesforce CLI and sfdx-git-delta'
+
+          - script: |
+              PREV_TAG=$(cat /tmp/prev-tag.txt)
+              if [ -z "$PREV_TAG" ]; then
+                echo "No previous release tag found — this is the first release, nothing to diff against. Skipping delta generation."
+                exit 0
+              fi
+
+              mkdir -p auto-delta
+              # --from is the CURRENT (new, just-deployed) state, --to is the
+              # PREVIOUS release tag. This produces:
+              #  - package.xml: components that differ in PREV_TAG relative
+              #    to this release — i.e. exactly what a rollback FROM this
+              #    release TO the previous one would need to redeploy.
+              #  - destructiveChanges.xml: components present in this release
+              #    but absent from PREV_TAG — i.e. net-new additions that a
+              #    rollback would need to delete.
+              # Committed below so the rollback pipeline can use these
+              # directly instead of recomputing the delta at rollback time.
+              sf sgd source delta \
+                --from "HEAD" \
+                --to "$PREV_TAG" \
+                --output-dir auto-delta \
+                --generate-delta
+              SGD_EXIT=$?
+              if [ $SGD_EXIT -ne 0 ]; then
+                echo "##vso[task.logissue type=warning]sfdx-git-delta command failed with exit code $SGD_EXIT — skipping delta record for this release (non-fatal, deploy already succeeded)."
+                exit 0
+              fi
+
+              if [ -f auto-delta/package/package.xml ]; then
+                echo "----- package.xml (for future rollback FROM this release) -----"
+                cat auto-delta/package/package.xml
+              fi
+              if [ -f auto-delta/destructiveChanges/destructiveChanges.xml ]; then
+                echo "----- destructiveChanges.xml (net-new components this release added) -----"
+                cat auto-delta/destructiveChanges/destructiveChanges.xml
+              fi
+            displayName: 'Generate rollback delta record for this release (vs previous tag)'
+
+          - script: |
               TAG="release-$(date +%Y-%m-%d)-$(Build.BuildId)"
+              echo "$TAG" > /tmp/new-tag.txt
+
+              if [ -f auto-delta/package/package.xml ] || [ -f auto-delta/destructiveChanges/destructiveChanges.xml ]; then
+                mkdir -p "rollback/releases/${TAG}"
+                [ -f auto-delta/package/package.xml ] && cp auto-delta/package/package.xml "rollback/releases/${TAG}/package.xml"
+                [ -f auto-delta/destructiveChanges/destructiveChanges.xml ] && cp auto-delta/destructiveChanges/destructiveChanges.xml "rollback/releases/${TAG}/destructiveChanges.xml"
+
+                git config user.email "azuredevops@pipeline"
+                git config user.name "Azure Pipeline"
+                git add "rollback/releases/${TAG}"
+                git commit -m "Add rollback delta record for ${TAG}"
+                git push origin HEAD:main
+                echo "Committed rollback/releases/${TAG}/ to main"
+              else
+                echo "No delta files to commit for this release."
+              fi
+            displayName: 'Commit rollback delta record to main (if generated)'
+
+          - script: |
+              TAG=$(cat /tmp/new-tag.txt)
               git config user.email "azuredevops@pipeline"
               git config user.name "Azure Pipeline"
               git tag -a "$TAG" -m "Production release $(Build.BuildId)"
