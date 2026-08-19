@@ -1,6 +1,7 @@
 trigger OpportunityTrigger on Opportunity (before insert , before update) {
 
-    if(Trigger.isBefore & (Trigger.isInsert || Trigger.isUpdate)) {
+    if(Trigger.isBefore 
+    & (Trigger.isInsert || Trigger.isUpdate)) {
 
         OpportunityTriggerHandler.handleBeforeInsertUpdate(Trigger.new, Trigger.oldMap);
     }
