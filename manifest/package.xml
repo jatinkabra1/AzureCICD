@@ -31,7 +31,6 @@
 		<members>Account.SLAExpirationDate__c</members>
 		<members>Account.SLA__c</members>
 		<members>Account.UpsellOpportunity__c</members>
-		<members>Case.EngineeringReqNumber__c</members>
 		<members>Case.PotentialLiability__c</members>
 		<members>Case.Product__c</members>
 		<members>Case.SLAViolation__c</members>
@@ -41,7 +40,6 @@
 		<members>Lead.NumberofLocations__c</members>
 		<members>Lead.Primary__c</members>
 		<members>Lead.ProductInterest__c</members>
-		<members>Lead.SICCode__c</members>
 		<members>Opportunity.CurrentGenerators__c</members>
 		<members>Opportunity.DeliveryInstallationStatus__c</members>
 		<members>Opportunity.MainCompetitors__c</members>
