@@ -1,11 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <CustomLabels xmlns="http://soap.sforce.com/2006/04/metadata">
     <labels>
-        <fullName>Release_1</fullName>
-        <categories>Release 1</categories>
+        <fullName>Demo_LAbel</fullName>
         <language>en_US</language>
         <protected>true</protected>
-        <shortDescription>Release 1</shortDescription>
-        <value>hdbdsg</value>
+        <shortDescription>Demo LAbel</shortDescription>
+        <value>Demo</value>
     </labels>
 </CustomLabels>
