@@ -280,7 +280,6 @@ stages:
 
 # ============================================================================
 # STAGE 4: SMOKE TEST — quick post-deploy sanity checks against Production.
-# If this fails, the Rollback stage is triggered automatically.
 # ============================================================================
   - stage: SmokeTest
     displayName: 'Post-deploy smoke tests'
