@@ -307,7 +307,69 @@ stages:
               echo "sf CLI exit code: $DEPLOY_EXIT | reported status: $DEPLOY_STATUS"
 
               if [ "$DEPLOY_EXIT" -ne 0 ] || [ "$DEPLOY_STATUS" == "Failed" ] || [ "$DEPLOY_STATUS" == "PARSE_ERROR" ]; then
-                echo "##vso[task.logissue type=error]Salesforce deployment failed (exit code $DEPLOY_EXIT, status $DEPLOY_STATUS). Failing this step so SmokeTest/TagRelease never run against a broken deploy."
+                # ---------------------------------------------------------
+                # ACCUMULATE ALL ERRORS INTO ONE READABLE SUMMARY.
+                # The raw --json output buries individual component/test
+                # failures inside nested arrays that are painful to read in
+                # a build log. This pulls every component failure and every
+                # Apex test failure out into a flat, numbered, human-
+                # readable list, writes it to deploy-errors.txt (published
+                # as a pipeline artifact so it can be opened directly), and
+                # also emits each one as a ##vso logissue so it shows up in
+                # the pipeline's "Issues" tab without opening the log at all.
+                # ---------------------------------------------------------
+                node -e "
+                  const fs = require('fs');
+                  let out = [];
+                  try {
+                    const r = JSON.parse(fs.readFileSync('deploy-result.json'));
+                    const details = (r.result && r.result.details) || {};
+
+                    let compFailures = details.componentFailures || [];
+                    if (!Array.isArray(compFailures)) compFailures = [compFailures];
+
+                    let testFailures = (details.runTestResult && details.runTestResult.failures) || [];
+                    if (!Array.isArray(testFailures)) testFailures = [testFailures];
+
+                    if (compFailures.length) {
+                      out.push('===== COMPONENT FAILURES (' + compFailures.length + ') =====');
+                      compFailures.forEach((f, i) => {
+                        out.push(
+                          (i + 1) + '. ' + (f.fullName || f.componentType || 'Unknown component') +
+                          ' [' + (f.fileName || 'no file') + (f.lineNumber ? ':' + f.lineNumber : '') + ']\n' +
+                          '   ' + (f.problem || 'No error message provided')
+                        );
+                      });
+                    }
+
+                    if (testFailures.length) {
+                      out.push('===== APEX TEST FAILURES (' + testFailures.length + ') =====');
+                      testFailures.forEach((f, i) => {
+                        out.push(
+                          (i + 1) + '. ' + (f.name || 'UnknownClass') + '.' + (f.methodName || 'unknownMethod') + '\n' +
+                          '   Message: ' + (f.message || 'n/a') + '\n' +
+                          '   Stack: ' + (f.stackTrace || 'n/a')
+                        );
+                      });
+                    }
+
+                    if (!compFailures.length && !testFailures.length) {
+                      out.push('No structured component/test failures found in deploy-result.json.');
+                      out.push('Top-level error message: ' + (r.message || (r.result && r.result.errorMessage) || 'none'));
+                    }
+                  } catch (e) {
+                    out.push('Could not parse deploy-result.json: ' + e.message);
+                  }
+                  fs.writeFileSync('deploy-errors.txt', out.join('\n\n'));
+                  console.log(out.join('\n\n'));
+                "
+
+                echo "----- Raising each failure as a pipeline issue -----"
+                while IFS= read -r line; do
+                  [ -n "$line" ] && echo "##vso[task.logissue type=error]$line"
+                done < <(grep -E '^[0-9]+\.' deploy-errors.txt)
+
+                echo "##vso[task.logissue type=error]Salesforce deployment failed (exit code $DEPLOY_EXIT, status $DEPLOY_STATUS). See deploy-errors.txt (published artifact) for the full readable breakdown. Failing this step so SmokeTest/TagRelease never run against a broken deploy."
                 exit 1
               fi
 
@@ -317,6 +379,11 @@ stages:
 
           - publish: deploy-result.json
             artifact: deploy-result
+            condition: always()
+
+          - publish: deploy-errors.txt
+            artifact: deploy-errors
+            condition: failed()
 
 # ============================================================================
 # STAGE 4: SMOKE TEST — quick post-deploy sanity checks against Production.
