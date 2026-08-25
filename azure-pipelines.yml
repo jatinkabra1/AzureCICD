@@ -266,18 +266,6 @@ stages:
           - publish: deploy-result.json
             artifact: deploy-result
 
-          # Store this exact deployed source as a rollback artifact, tagged
-          # with the commit SHA so it can be redeployed later if needed.
-          - script: |
-              mkdir -p rollback-package
-              cp -r force-app rollback-package/
-              cp sfdx-project.json rollback-package/
-              echo "$(Build.SourceVersion)" > rollback-package/commit.txt
-            displayName: 'Snapshot deployed metadata for rollback'
-
-          - publish: rollback-package
-            artifact: 'last-good-deploy-$(Build.SourceVersion)'
-
 # ============================================================================
 # STAGE 4: SMOKE TEST — quick post-deploy sanity checks against Production.
 # ============================================================================
@@ -324,12 +312,25 @@ stages:
 
 # ============================================================================
 # STAGE 5: TAG — tag the commit in git as the last known-good release.
-# Only runs if smoke tests passed (or were deliberately skipped).
+# Runs only if Deploy actually succeeded AND SmokeTest either passed or was
+# intentionally skipped via the skipSmokeTest parameter.
+#
+# NOTE ON THE FIX: dependsOn now lists BOTH Deploy and SmokeTest, and the
+# condition explicitly checks dependencies.Deploy.result == 'Succeeded'.
+# This matters because in Azure DevOps, a stage that is skipped because an
+# UPSTREAM stage failed also reports its result as 'Skipped' — the same
+# value used when skipSmokeTest=true is passed on purpose. Without checking
+# Deploy's result directly, a failed Deploy would cause SmokeTest to be
+# skipped (dependency failed), which would then satisfy
+# in(dependencies.SmokeTest.result, 'Succeeded','Skipped') and let
+# TagRelease run anyway — tagging a broken deploy as a good release.
 # ============================================================================
   - stage: TagRelease
     displayName: 'Tag release'
-    dependsOn: SmokeTest
-    condition: in(dependencies.SmokeTest.result, 'Succeeded', 'Skipped')
+    dependsOn:
+      - Deploy
+      - SmokeTest
+    condition: and(eq(dependencies.Deploy.result, 'Succeeded'), in(dependencies.SmokeTest.result, 'Succeeded', 'Skipped'))
     jobs:
       - job: CreateTag
         displayName: 'Create release tag'
@@ -339,77 +340,7 @@ stages:
             fetchDepth: 0
 
           - script: |
-              PREV_TAG=$(git tag -l "release-*" --sort=-creatordate | head -n 1)
-              echo "Previous release tag (before this deploy): ${PREV_TAG:-<none — first release>}"
-              echo "$PREV_TAG" > /tmp/prev-tag.txt
-            displayName: 'Identify previous release tag'
-
-          - script: |
-              npm install --global @salesforce/cli
-              echo y | sf plugins install sfdx-git-delta
-            displayName: 'Install Salesforce CLI and sfdx-git-delta'
-
-          - script: |
-              PREV_TAG=$(cat /tmp/prev-tag.txt)
-              if [ -z "$PREV_TAG" ]; then
-                echo "No previous release tag found — this is the first release, nothing to diff against. Skipping delta generation."
-                exit 0
-              fi
-
-              mkdir -p auto-delta
-              # --from is the CURRENT (new, just-deployed) state, --to is the
-              # PREVIOUS release tag. This produces:
-              #  - package.xml: components that differ in PREV_TAG relative
-              #    to this release — i.e. exactly what a rollback FROM this
-              #    release TO the previous one would need to redeploy.
-              #  - destructiveChanges.xml: components present in this release
-              #    but absent from PREV_TAG — i.e. net-new additions that a
-              #    rollback would need to delete.
-              # Committed below so the rollback pipeline can use these
-              # directly instead of recomputing the delta at rollback time.
-              sf sgd source delta \
-                --from "HEAD" \
-                --to "$PREV_TAG" \
-                --output-dir auto-delta \
-                --generate-delta
-              SGD_EXIT=$?
-              if [ $SGD_EXIT -ne 0 ]; then
-                echo "##vso[task.logissue type=warning]sfdx-git-delta command failed with exit code $SGD_EXIT — skipping delta record for this release (non-fatal, deploy already succeeded)."
-                exit 0
-              fi
-
-              if [ -f auto-delta/package/package.xml ]; then
-                echo "----- package.xml (for future rollback FROM this release) -----"
-                cat auto-delta/package/package.xml
-              fi
-              if [ -f auto-delta/destructiveChanges/destructiveChanges.xml ]; then
-                echo "----- destructiveChanges.xml (net-new components this release added) -----"
-                cat auto-delta/destructiveChanges/destructiveChanges.xml
-              fi
-            displayName: 'Generate rollback delta record for this release (vs previous tag)'
-
-          - script: |
               TAG="release-$(date +%Y-%m-%d)-$(Build.BuildId)"
-              echo "$TAG" > /tmp/new-tag.txt
-
-              if [ -f auto-delta/package/package.xml ] || [ -f auto-delta/destructiveChanges/destructiveChanges.xml ]; then
-                mkdir -p "rollback/releases/${TAG}"
-                [ -f auto-delta/package/package.xml ] && cp auto-delta/package/package.xml "rollback/releases/${TAG}/package.xml"
-                [ -f auto-delta/destructiveChanges/destructiveChanges.xml ] && cp auto-delta/destructiveChanges/destructiveChanges.xml "rollback/releases/${TAG}/destructiveChanges.xml"
-
-                git config user.email "azuredevops@pipeline"
-                git config user.name "Azure Pipeline"
-                git add "rollback/releases/${TAG}"
-                git commit -m "Add rollback delta record for ${TAG}"
-                git push origin HEAD:main
-                echo "Committed rollback/releases/${TAG}/ to main"
-              else
-                echo "No delta files to commit for this release."
-              fi
-            displayName: 'Commit rollback delta record to main (if generated)'
-
-          - script: |
-              TAG=$(cat /tmp/new-tag.txt)
               git config user.email "azuredevops@pipeline"
               git config user.name "Azure Pipeline"
               git tag -a "$TAG" -m "Production release $(Build.BuildId)"
