@@ -1,0 +1,15 @@
+<template>
+    <lightning-card title="Demo Records" icon-name="standard:record">
+        <div class="slds-p-horizontal_small slds-p-bottom_small">
+            <lightning-datatable
+                key-field="id"
+                data={data}
+                columns={columns}
+                hide-checkbox-column>
+            </lightning-datatable>
+            <p class="slds-text-body_small slds-p-top_small slds-text-color_weak">
+                {rowCount} records
+            </p>
+        </div>
+    </lightning-card>
+</template>
