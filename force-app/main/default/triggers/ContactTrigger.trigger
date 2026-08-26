@@ -1,6 +1,6 @@
 trigger ContactTrigger on Contact (before insert, before update){
     
-    ContactTriggerHandler.handler (
+    ContactTriggerHandler.handle (
         Trigger.isInsert,
         Trigger.isUpdate,
         Trigger.new,
