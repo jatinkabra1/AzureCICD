@@ -1,20 +1,13 @@
 # ============================================================================
 # Salesforce CI/CD Pipeline — Azure DevOps
 # Flow: Validate (PR) -> Approve -> Deploy -> Smoke Test -> Tag Release
-# Manually triggered (no auto-run on merge to main). No automatic rollback —
-# if smoke tests fail, no tag is created and NO rollback stage runs here.
-# Use the separate azure-pipelines-rollback.yml pipeline to roll back
-# on-demand if needed.
+# Manually triggered (no auto-run on merge to main).
 #
-# FIX APPLIED (2026-08-25): the Validate and Deploy stage scripts used to
-# end with `cat <result>.json` as their last command. In Azure DevOps, a
-# script step's exit code is whatever the LAST command returned — so `cat`
-# succeeding was masking a failed `sf` command underneath it. That let a
-# genuinely failed Salesforce deploy get reported as a "Succeeded" stage,
-# which in turn satisfied TagRelease's condition and tagged a broken
-# release. Both scripts now capture the sf CLI's real exit code BEFORE the
-# `cat`, cross-check the JSON result's own status field as a second
-# safeguard, and explicitly exit 1 on any failure.
+# TAGGING SAFETY: TagRelease will NOT run unless Deploy's result is exactly
+# 'Succeeded' (checked explicitly, not inferred) AND SmokeTest either
+# succeeded or was intentionally skipped. See the note above the TagRelease
+# stage below for why this has to be checked explicitly rather than relying
+# on a plain succeeded().
 # ============================================================================
 
 trigger: none   # disabled — pipeline no longer runs automatically on merge to main.
@@ -24,7 +17,7 @@ trigger: none   # disabled — pipeline no longer runs automatically on merge to
 pr:
   branches:
     include:
-      - none          # PRs into main still trigger Validate automatically (check-only, no deploy)
+      - none          # PRs into main trigger Validate automatically (check-only, no deploy)
 
 parameters:
   - name: skipSmokeTest
@@ -32,7 +25,7 @@ parameters:
     type: boolean
     default: false
   - name: forceSmokeTestFailure
-    displayName: 'Force smoke test to fail'
+    displayName: 'Force smoke test to fail (testing only)'
     type: boolean
     default: false
 
@@ -41,7 +34,7 @@ pool:
 
 variables:
   - group: sf-prod-secrets      # SF_PROD_CONSUMER_KEY, SF_PROD_USERNAME, SF_PROD_LOGIN_URL
-  - group: sf-dev-secrets       # SF_DEV_CONSUMER_KEY, SF_DEV_USERNAME, SF_DEV_LOGIN_URL (optional, if you validate/test against Dev too)
+  - group: sf-dev-secrets       # SF_DEV_CONSUMER_KEY, SF_DEV_USERNAME, SF_DEV_LOGIN_URL
   - name: sfdxTestLevel
     value: 'RunLocalTests'      # or RunSpecifiedTests / RunAllTestsInOrg
   - name: prodAlias
@@ -60,7 +53,7 @@ stages:
         displayName: 'sf project deploy validate'
         steps:
           - checkout: self
-            fetchDepth: 0    # full history needed for git delta diffing
+            fetchDepth: 0
 
           - task: DownloadSecureFile@1
             name: prodJwtKey
@@ -83,7 +76,6 @@ stages:
             displayName: 'Authenticate to Production org (JWT)'
 
           - script: |
-              set -o pipefail
               sf project deploy validate \
                 --source-dir force-app \
                 --target-org $(prodAlias) \
@@ -122,8 +114,8 @@ stages:
 
 # ============================================================================
 # STAGE 2: APPROVE — gated by the Production environment's approval check
-# (configured in Azure DevOps: Pipelines > Environments > Production).
-# Only runs on actual merges to main, not on PR validation.
+# (Pipelines > Environments > Production). Only runs on actual merges to
+# main, not on PR validation.
 # ============================================================================
   - stage: Approve
     displayName: 'Manual approval for Production deploy'
@@ -132,7 +124,7 @@ stages:
     jobs:
       - deployment: ApprovalGate
         displayName: 'Await Production approval'
-        environment: 'Production'   # approvers configured on this environment in Azure DevOps UI
+        environment: 'Production'
         strategy:
           runOnce:
             deploy:
@@ -141,9 +133,8 @@ stages:
                   displayName: 'Approval confirmed'
 
 # ============================================================================
-# STAGE 3: DEPLOY — deploys to Production. Uses the already-validated job
-# (quick deploy) when triggered from a fresh merge; falls back to a normal
-# deploy if no valid validation id is available.
+# STAGE 3: DEPLOY — delta-based deploy to Production (only changed
+# components, not the whole force-app directory), including any deletions.
 # ============================================================================
   - stage: Deploy
     displayName: 'Deploy to Production'
@@ -164,8 +155,9 @@ stages:
 
           - script: |
               npm install --global @salesforce/cli
+              echo y | sf plugins install sfdx-git-delta
               sf --version
-            displayName: 'Install Salesforce CLI'
+            displayName: 'Install Salesforce CLI and sfdx-git-delta'
 
           - script: |
               sf org login jwt \
@@ -176,21 +168,16 @@ stages:
                 --alias $(prodAlias)
             displayName: 'Authenticate to Production org (JWT)'
 
-          # DESTRUCTIVE CHANGES FOR DELETED FILES: a normal source deploy is
+          # DELTA + DESTRUCTIVE CHANGES: a normal source deploy is
           # additive-only — deleting a field/class/etc. from git does NOT
-          # remove it from the org unless explicitly told to. This step
-          # diffs the last deployed release against the current commit to
-          # find anything that was deleted in git, and builds a
-          # destructiveChanges.xml for it. --from is the PREVIOUS release
-          # (what's currently live in Prod), --to is HEAD (this new deploy)
-          # — so destructiveChanges.xml lists components present in Prod's
-          # current state but absent from this new commit, i.e. exactly
-          # what was deleted and needs removing from the org.
-          - script: |
-              npm install --global @salesforce/cli
-              echo y | sf plugins install sfdx-git-delta
-            displayName: 'Install sfdx-git-delta'
-
+          # remove it from the org unless explicitly told to. --from is the
+          # PREVIOUS release (what's currently live in Prod), --to is HEAD
+          # (this new deploy). destructiveChanges.xml lists components
+          # present in Prod's current state but absent from this new commit
+          # — i.e. exactly what was deleted in git and needs removing from
+          # the org. package.xml lists everything added/modified since the
+          # last release, so only actual changes get deployed, not the
+          # entire force-app directory.
           - script: |
               PREV_TAG=$(git tag -l "release-*" --sort=-creatordate | head -n 1)
               echo "$PREV_TAG" > /tmp/prev-tag-for-deploy.txt
@@ -208,14 +195,13 @@ stages:
                 --generate-delta
               SGD_EXIT=$?
               if [ $SGD_EXIT -ne 0 ]; then
-                # DELIBERATELY NOT a silent fallback here: on any deploy
-                # after the first, we cannot know whether something was
-                # deleted in git since $PREV_TAG without this delta. Silently
-                # falling back to a full source-dir deploy would deploy
-                # additively only, leaving any deleted component still
-                # sitting in Prod with no indication anything was missed.
-                # Failing loudly forces investigation instead.
-                echo "##vso[task.logissue type=error]sfdx-git-delta failed with exit code $SGD_EXIT. Cannot safely determine whether any components were deleted since $PREV_TAG. Deploy stopped rather than risk silently leaving deleted components in Production. Investigate the sfdx-git-delta error above, or re-run once resolved."
+                # DELIBERATELY NOT a silent fallback: on any deploy after the
+                # first, we cannot know whether something was deleted in git
+                # since $PREV_TAG without this delta. Silently falling back
+                # to a full source-dir deploy would deploy additively only,
+                # leaving any deleted component still sitting in Prod with
+                # no indication anything was missed. Fail loudly instead.
+                echo "##vso[task.logissue type=error]sfdx-git-delta failed with exit code $SGD_EXIT. Cannot safely determine whether any components were deleted since $PREV_TAG. Deploy stopped rather than risk silently leaving deleted components in Production."
                 exit 1
               fi
 
@@ -233,6 +219,44 @@ stages:
                 echo "No components were deleted since $PREV_TAG."
               fi
 
+              # SAFETY FILTER: sgd can occasionally flag a standard object
+              # (Opportunity, Lead, Account, etc.) as a CustomObject to
+              # delete — this happens when a custom field is the first
+              # piece of tracked metadata ever committed under that
+              # object's folder, making the whole folder look "new" in git
+              # even though the standard object itself always existed in
+              # the org. Standard objects can never legitimately be
+              # deleted, so any such entry is stripped here.
+              if [ -f forward-delta/destructiveChanges/destructiveChanges.xml ]; then
+                python3 - forward-delta/destructiveChanges/destructiveChanges.xml << 'PYEOF'
+              import sys
+              import xml.etree.ElementTree as ET
+
+              target_file = sys.argv[1]
+              ns = "{http://soap.sforce.com/2006/04/metadata}"
+              ET.register_namespace('', ns.strip('{}'))
+              tree = ET.parse(target_file)
+              root = tree.getroot()
+
+              removed = []
+              for types_el in list(root.findall(f"{ns}types")):
+                  type_name_el = types_el.find(f"{ns}name")
+                  if type_name_el is not None and type_name_el.text == "CustomObject":
+                      for m in list(types_el.findall(f"{ns}members")):
+                          if not m.text.endswith("__c"):
+                              removed.append(m.text)
+                              types_el.remove(m)
+                      if not types_el.findall(f"{ns}members"):
+                          root.remove(types_el)
+
+              if removed:
+                  print(f"##vso[task.logissue type=warning]Removed {len(removed)} standard object(s) incorrectly flagged for deletion: {', '.join(removed)}.")
+                  tree.write(target_file, xml_declaration=True, encoding='UTF-8')
+              else:
+                  print("No standard-object false positives found.")
+              PYEOF
+              fi
+
               # If there's nothing to add/modify (pure-deletion release), the
               # CLI still needs a --manifest to pair with
               # --post-destructive-changes — provide an empty one.
@@ -248,16 +272,11 @@ stages:
             displayName: 'Compute delta of added/modified/deleted components since last release'
 
           - script: |
-              set -o pipefail
               MANIFEST="forward-delta/package/package.xml"
               DESTRUCTIVE="forward-delta/destructiveChanges/destructiveChanges.xml"
 
               DEPLOY_EXIT=0
               if [ -f "$MANIFEST" ]; then
-                # DELTA DEPLOY: only components that actually changed since
-                # the last release get deployed — not the entire force-app
-                # directory. Deletions (if any) are applied in the same
-                # transaction via --post-destructive-changes.
                 if [ -f "$DESTRUCTIVE" ]; then
                   sf project deploy start \
                     --manifest "$MANIFEST" \
@@ -279,11 +298,9 @@ stages:
                 fi
               else
                 # FALLBACK: only reached on a genuine first-ever deploy (no
-                # previous tag existed, so nothing to diff against — safe,
-                # nothing could have been deleted). If sgd had failed on a
-                # later deploy, the previous step already stopped the
-                # pipeline before reaching here — this fallback deliberately
-                # does NOT trigger in that case.
+                # previous tag existed — nothing could have been deleted).
+                # If sgd had failed on a later deploy, the previous step
+                # already stopped the pipeline before reaching here.
                 echo "No delta manifest available — deploying full force-app directory."
                 sf project deploy start \
                   --source-dir force-app \
@@ -307,17 +324,9 @@ stages:
               echo "sf CLI exit code: $DEPLOY_EXIT | reported status: $DEPLOY_STATUS"
 
               if [ "$DEPLOY_EXIT" -ne 0 ] || [ "$DEPLOY_STATUS" == "Failed" ] || [ "$DEPLOY_STATUS" == "PARSE_ERROR" ]; then
-                # ---------------------------------------------------------
-                # ACCUMULATE ALL ERRORS INTO ONE READABLE SUMMARY.
-                # The raw --json output buries individual component/test
-                # failures inside nested arrays that are painful to read in
-                # a build log. This pulls every component failure and every
-                # Apex test failure out into a flat, numbered, human-
-                # readable list, writes it to deploy-errors.txt (published
-                # as a pipeline artifact so it can be opened directly), and
-                # also emits each one as a ##vso logissue so it shows up in
-                # the pipeline's "Issues" tab without opening the log at all.
-                # ---------------------------------------------------------
+                # Pull structured component/test failures into a flat,
+                # readable summary — raised individually as pipeline issues
+                # and published as a downloadable artifact.
                 node -e "
                   const fs = require('fs');
                   let out = [];
@@ -369,7 +378,7 @@ stages:
                   [ -n "$line" ] && echo "##vso[task.logissue type=error]$line"
                 done < <(grep -E '^[0-9]+\.' deploy-errors.txt)
 
-                echo "##vso[task.logissue type=error]Salesforce deployment failed (exit code $DEPLOY_EXIT, status $DEPLOY_STATUS). See deploy-errors.txt (published artifact) for the full readable breakdown. Failing this step so SmokeTest/TagRelease never run against a broken deploy."
+                echo "##vso[task.logissue type=error]Salesforce deployment failed (exit code $DEPLOY_EXIT, status $DEPLOY_STATUS). See deploy-errors.txt (published artifact) for the full breakdown. Failing this step so SmokeTest/TagRelease never run against a broken deploy."
                 exit 1
               fi
 
@@ -386,7 +395,7 @@ stages:
             condition: failed()
 
 # ============================================================================
-# STAGE 4: SMOKE TEST — quick post-deploy sanity checks against Production.
+# STAGE 4: SMOKE TEST — post-deploy sanity checks against Production.
 # ============================================================================
   - stage: SmokeTest
     displayName: 'Post-deploy smoke tests'
@@ -415,7 +424,7 @@ stages:
 
           - script: |
               if [ "${{ parameters.forceSmokeTestFailure }}" == "True" ]; then
-                echo "##vso[task.logissue type=warning]forceSmokeTestFailure=true — deliberately failing smoke test to exercise the automatic Rollback stage."
+                echo "##vso[task.logissue type=warning]forceSmokeTestFailure=true — deliberately failing smoke test."
                 exit 1
               fi
 
@@ -434,17 +443,13 @@ stages:
 # Runs only if Deploy actually succeeded AND SmokeTest either passed or was
 # intentionally skipped via the skipSmokeTest parameter.
 #
-# NOTE ON THE FIX: dependsOn lists BOTH Deploy and SmokeTest, and the
-# condition explicitly checks dependencies.Deploy.result == 'Succeeded'.
-# This matters because in Azure DevOps, a stage that is skipped because an
-# UPSTREAM stage failed also reports its result as 'Skipped' — the same
-# value used when skipSmokeTest=true is passed on purpose. Without checking
-# Deploy's result directly, a failed Deploy would cause SmokeTest to be
-# skipped (dependency failed), which would then satisfy
+# WHY Deploy.result IS CHECKED EXPLICITLY: if Deploy fails, SmokeTest never
+# runs because its dependency failed — and Azure DevOps reports THAT as
+# 'Skipped', the exact same value used when skipSmokeTest=true is passed on
+# purpose. Without checking Deploy's own result directly, a failed Deploy
+# could produce a SmokeTest result of 'Skipped', which would satisfy
 # in(dependencies.SmokeTest.result, 'Succeeded','Skipped') and let
-# TagRelease run anyway — tagging a broken deploy as a good release. This
-# check only works correctly now that the Deploy stage script (above)
-# actually fails when the Salesforce deploy fails.
+# TagRelease run anyway — tagging a broken deploy as a good release.
 # ============================================================================
   - stage: TagRelease
     displayName: 'Tag release'
