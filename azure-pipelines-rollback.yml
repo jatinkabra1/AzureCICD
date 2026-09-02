@@ -1,11 +1,17 @@
 # ============================================================================
 # Salesforce Standalone Rollback Pipeline — Azure DevOps
 # On-demand "break glass" rollback, independent of the main deploy pipeline.
-# Trigger manually from the Azure DevOps UI ("Run pipeline") and supply the
-# release tag to roll back to (e.g. release-2026-07-28-142).
+# Trigger manually from the Azure DevOps UI ("Run pipeline").
+#
+# TAGGING SAFETY: TagRollbackEvent will NOT run unless DeployRollback's
+# result is exactly 'Succeeded'. Every deploy/validate/delete step below
+# captures the sf CLI's real exit code immediately after the command runs
+# (not after a trailing `cat`, which would mask it) and cross-checks the
+# JSON result's own status field as a second safeguard, explicitly exiting
+# 1 on any failure so this propagates correctly.
 # ============================================================================
 
-trigger: none   # never runs automatically — manual trigger only
+trigger: none
 pr: none
 
 pool:
@@ -13,7 +19,7 @@ pool:
 
 parameters:
   - name: releaseTag
-    displayName: 'Release tag to roll back to. "previous" = second-newest tag (safe default — skips the newest, likely-bad release). "latest" = newest tag. Or type an exact tag name.'
+    displayName: 'Release tag to roll back to. "previous" = second-newest tag (safe default). "latest" = newest tag. Or type an exact tag name.'
     type: string
     default: 'previous'
   - name: testLevel
@@ -36,13 +42,9 @@ variables:
 
 # ============================================================================
 # STAGE 1: RESOLVE TAG.
-# "previous" (default) = second-newest release-* tag. The newest tag is
-# skipped, since it's normally the release you're rolling back AWAY from
-# (i.e. the one that's currently live and presumably the problem) — this is
-# the safer default for a typical "something's wrong, go back one step" use.
-# "latest" = newest release-* tag, for cases where you deliberately want to
-# redeploy the current tagged state (rare — mostly for testing/recovery).
-# Any other value is treated as an exact tag name.
+# "previous" (default) = second-newest release-* tag — skips the newest,
+# since that's normally the release you're rolling back AWAY from.
+# "latest" = newest release-* tag. Anything else = exact tag name.
 # ============================================================================
 stages:
   - stage: ResolveTag
@@ -56,9 +58,6 @@ stages:
 
           - script: |
               if [ "${{ parameters.releaseTag }}" == "previous" ]; then
-                # Skip the newest tag — it's usually the release you're
-                # currently rolling back AWAY from (i.e. the likely-bad one)
-                # — and take the one before it instead.
                 TAG=$(git tag -l "release-*" --sort=-creatordate | sed -n '2p')
                 if [ -z "$TAG" ]; then
                   echo "##vso[task.logissue type=error]Fewer than 2 release-* tags found — cannot resolve 'previous'. Use 'latest' or specify an exact tag."
@@ -83,8 +82,7 @@ stages:
             displayName: 'Resolve target release tag'
 
 # ============================================================================
-# STAGE 2: PREPARE — validate inputs and confirm the target tag exists before
-# anything touches Production. Fails fast on bad input or missing tag.
+# STAGE 2: PREPARE — validate inputs and confirm the target tag exists.
 # ============================================================================
   - stage: Prepare
     displayName: 'Validate rollback target'
@@ -115,8 +113,7 @@ stages:
             displayName: 'Verify release tag exists'
 
 # ============================================================================
-# STAGE 2: VALIDATE ROLLBACK — check-only deploy of the tagged metadata
-# against Production, so you know it will succeed before committing to it.
+# STAGE 3: VALIDATE ROLLBACK — check-only deploy of the tagged metadata.
 # ============================================================================
   - stage: ValidateRollback
     displayName: 'Validate rollback deploy (check-only)'
@@ -162,16 +159,32 @@ stages:
                 --target-org $(prodAlias) \
                 --test-level ${{ parameters.testLevel }} \
                 --json > rollback-validate-result.json
+              VALIDATE_EXIT=$?
+
               cat rollback-validate-result.json
+
+              VALIDATE_STATUS=$(node -e "
+                try {
+                  const r = JSON.parse(require('fs').readFileSync('rollback-validate-result.json'));
+                  console.log(r.status || (r.result && r.result.status) || 'Unknown');
+                } catch (e) { console.log('PARSE_ERROR'); }
+              ")
+              echo "sf CLI exit code: $VALIDATE_EXIT | reported status: $VALIDATE_STATUS"
+
+              if [ "$VALIDATE_EXIT" -ne 0 ] || [ "$VALIDATE_STATUS" == "Failed" ] || [ "$VALIDATE_STATUS" == "PARSE_ERROR" ]; then
+                echo "##vso[task.logissue type=error]Rollback validation FAILED (exit code $VALIDATE_EXIT, status $VALIDATE_STATUS). Stopping here — approval and deploy will not proceed."
+                exit 1
+              fi
+
+              echo "Rollback validation succeeded."
+              exit 0
             displayName: 'Check-only deploy of tagged metadata'
 
           - publish: rollback-validate-result.json
             artifact: rollback-validate-result
 
 # ============================================================================
-# STAGE 3: APPROVE — manual approval gate on the Production environment.
-# Same gate used by the forward pipeline, so approvers see rollback requests
-# in the same place as regular deploys.
+# STAGE 4: APPROVE — manual approval gate on the Production environment.
 # ============================================================================
   - stage: ApproveRollback
     displayName: 'Manual approval for rollback'
@@ -194,7 +207,7 @@ stages:
                   displayName: 'Approval confirmed'
 
 # ============================================================================
-# STAGE 4: DEPLOY ROLLBACK — redeploys the tagged (previous stable) metadata
+# STAGE 5: DEPLOY ROLLBACK — redeploys the tagged (previous stable) metadata
 # to Production. Uses a git-delta computation so only components that
 # actually differ get redeployed, and automatically deletes any net-new
 # components the bad release added, that don't exist in the target tag.
@@ -224,25 +237,10 @@ stages:
               echo y | sf plugins install sfdx-git-delta
             displayName: 'Install Salesforce CLI and sfdx-git-delta'
 
-          # DELTA COMPUTATION: instead of redeploying the entire force-app
-          # folder (slow, deploys unchanged files too), compute exactly which
-          # components differ between the current bad state and the target
-          # tag. --from is the CURRENT (bad) state, --to is the TARGET (old,
-          # stable) tag. This single command produces BOTH:
-          #  - package.xml: modified files, and anything the bad release
-          #    deleted that needs restoring — deployed further below.
-          #  - destructiveChanges.xml: components present in the bad state
-          #    but absent from the target — i.e. exactly what the bad
-          #    release added and needs deleting. Fully automatic, no manual
-          #    input needed.
-          #
-          # NOTE ON COMMAND SYNTAX: the plugin's current published version
-          # uses space-separated command syntax ("sf sgd source delta") with
-          # "--output-dir" — NOT the older colon syntax ("sf sgd:source:delta")
-          # with "--output", which either fails outright or silently produces
-          # no output depending on installed version. Using the wrong form
-          # here was the root cause of components not being deleted on
-          # rollback in earlier testing.
+          # DELTA COMPUTATION: --from is the CURRENT (bad) state, --to is
+          # the TARGET (old, stable) tag. Produces BOTH package.xml
+          # (modified/restored components) and destructiveChanges.xml
+          # (net-new additions from the bad release that need deleting).
           - script: |
               BAD_COMMIT=$(cat /tmp/bad-commit.txt)
               mkdir -p rollback-delta
@@ -267,17 +265,63 @@ stages:
               if [ -f rollback-delta/destructiveChanges/destructiveChanges.xml ]; then
                 echo "----- Components to delete (net-new additions from bad release) -----"
                 cat rollback-delta/destructiveChanges/destructiveChanges.xml
+              else
+                echo "No components to delete — bad release only modified existing components."
+              fi
+            displayName: 'Compute delta of changed components (bad state vs target tag)'
 
+          # SAFETY FILTER: strip any standard object (Opportunity, Lead,
+          # Account, etc.) that sgd may have incorrectly flagged as a
+          # CustomObject to delete — standard objects can never be deleted.
+          # See main pipeline for the full explanation of why this happens.
+          - script: |
+              DESTRUCTIVE="rollback-delta/destructiveChanges/destructiveChanges.xml"
+              if [ ! -f "$DESTRUCTIVE" ]; then
+                echo "No destructiveChanges.xml to filter."
+                exit 0
+              fi
+
+              python3 - "$DESTRUCTIVE" << 'PYEOF'
+              import sys
+              import xml.etree.ElementTree as ET
+
+              target_file = sys.argv[1]
+              ns = "{http://soap.sforce.com/2006/04/metadata}"
+              ET.register_namespace('', ns.strip('{}'))
+              tree = ET.parse(target_file)
+              root = tree.getroot()
+
+              removed = []
+              for types_el in list(root.findall(f"{ns}types")):
+                  type_name_el = types_el.find(f"{ns}name")
+                  if type_name_el is not None and type_name_el.text == "CustomObject":
+                      for m in list(types_el.findall(f"{ns}members")):
+                          if not m.text.endswith("__c"):
+                              removed.append(m.text)
+                              types_el.remove(m)
+                      if not types_el.findall(f"{ns}members"):
+                          root.remove(types_el)
+
+              if removed:
+                  print(f"##vso[task.logissue type=warning]Removed {len(removed)} standard object(s) incorrectly flagged for deletion: {', '.join(removed)}.")
+                  tree.write(target_file, xml_declaration=True, encoding='UTF-8')
+              else:
+                  print("No standard-object false positives found.")
+              PYEOF
+
+              if [ -f "$DESTRUCTIVE" ]; then
+                mkdir -p rollback-delta
                 cat > rollback-delta/emptyPackage.xml << 'EOF'
               <?xml version="1.0" encoding="UTF-8"?>
               <Package xmlns="http://soap.sforce.com/2006/04/metadata">
                   <version>60.0</version>
               </Package>
               EOF
-              else
-                echo "No components to delete — bad release only modified existing components."
               fi
-            displayName: 'Compute delta of changed components (bad state vs target tag)'
+
+              echo "----- destructiveChanges.xml after filtering -----"
+              cat "$DESTRUCTIVE"
+            displayName: 'Filter out standard objects incorrectly flagged for deletion'
 
           - script: |
               echo "Checking out $(resolvedTag) to restore known-good metadata"
@@ -312,23 +356,27 @@ stages:
                   --ignore-warnings \
                   --json > destructive-deploy-result.json
                 DEPLOY_EXIT=$?
+
                 cat destructive-deploy-result.json
-                if [ $DEPLOY_EXIT -ne 0 ]; then
-                  echo "##vso[task.logissue type=error]Component deletion FAILED. Check the output above for dependency conflicts or data-loss warnings. The rollback deploy will still proceed below, but the deleted component(s) may still be present in Production."
-                else
-                  echo "Component deletion succeeded."
+
+                DEPLOY_STATUS=$(node -e "
+                  try {
+                    const r = JSON.parse(require('fs').readFileSync('destructive-deploy-result.json'));
+                    console.log(r.status || (r.result && r.result.status) || 'Unknown');
+                  } catch (e) { console.log('PARSE_ERROR'); }
+                ")
+                echo "sf CLI exit code: $DEPLOY_EXIT | reported status: $DEPLOY_STATUS"
+
+                if [ "$DEPLOY_EXIT" -ne 0 ] || [ "$DEPLOY_STATUS" == "Failed" ] || [ "$DEPLOY_STATUS" == "PARSE_ERROR" ]; then
+                  echo "##vso[task.logissue type=error]Component deletion FAILED (exit code $DEPLOY_EXIT, status $DEPLOY_STATUS). Check the output above for dependency conflicts or data-loss warnings (e.g. a field still referenced elsewhere). Stopping here — the metadata restore will NOT run, and no rollback tag will be created."
+                  exit 1
                 fi
+                echo "Component deletion succeeded."
               else
                 echo "No components to delete — proceeding straight to metadata restore."
               fi
             displayName: 'Delete components added by the bad release (auto-detected)'
 
-          # PARTIAL DEPLOY: uses the delta package.xml computed earlier, so
-          # only components that actually differ from the bad state get
-          # redeployed — not the entire force-app folder. The CLI resolves
-          # each listed component's content from the local project, which
-          # now reflects the target tag's (old, stable) source after the
-          # checkout above.
           - script: |
               if [ -f rollback-delta/package/package.xml ]; then
                 sf project deploy start \
@@ -337,7 +385,23 @@ stages:
                   --test-level ${{ parameters.testLevel }} \
                   --wait 60 \
                   --json > rollback-deploy-result.json
+                DEPLOY_EXIT=$?
+
                 cat rollback-deploy-result.json
+
+                DEPLOY_STATUS=$(node -e "
+                  try {
+                    const r = JSON.parse(require('fs').readFileSync('rollback-deploy-result.json'));
+                    console.log(r.status || (r.result && r.result.status) || 'Unknown');
+                  } catch (e) { console.log('PARSE_ERROR'); }
+                ")
+                echo "sf CLI exit code: $DEPLOY_EXIT | reported status: $DEPLOY_STATUS"
+
+                if [ "$DEPLOY_EXIT" -ne 0 ] || [ "$DEPLOY_STATUS" == "Failed" ] || [ "$DEPLOY_STATUS" == "PARSE_ERROR" ]; then
+                  echo "##vso[task.logissue type=error]Rollback metadata deploy FAILED (exit code $DEPLOY_EXIT, status $DEPLOY_STATUS). Check the output above. Stopping here — no rollback tag will be created."
+                  exit 1
+                fi
+                echo "Rollback metadata deploy succeeded."
               else
                 echo "Nothing to redeploy — target state matched the bad state except for deleted components (handled above, if any)."
               fi
@@ -347,8 +411,9 @@ stages:
             artifact: rollback-delta-manifest
 
 # ============================================================================
-# STAGE 5: POST-ROLLBACK TAG — mark this rollback in git history so the
-# audit trail shows a rollback happened and what it reverted to.
+# STAGE 6: POST-ROLLBACK TAG — mark this rollback in git history. Only
+# reachable if DeployRollback's result is exactly 'Succeeded', since every
+# step above now explicitly exits 1 on any real failure.
 # ============================================================================
   - stage: TagRollbackEvent
     displayName: 'Tag rollback event'
